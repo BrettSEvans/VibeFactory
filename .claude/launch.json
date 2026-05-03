@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "VibeFactory Web UI",
+      "runtimeExecutable": "/Users/brettevanssf/Code/Saasless/VibeFactory/venv/bin/python",
+      "runtimeArgs": ["web_ui.py"],
+      "cwd": "/Users/brettevanssf/Code/Saasless/VibeFactory",
+      "port": 8501
+    }
+  ]
+}
