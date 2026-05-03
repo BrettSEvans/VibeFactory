@@ -1,0 +1,103 @@
+name: VibeFactory CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rough_idea:
+        description: "Product idea to generate (optional smoke test)"
+        required: false
+        default: ""
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate imports
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python -c "from story_translator import StoryTranslator; print('✓ story_translator')"
+          python -c "from backend_generator import BackendGenerator; print('✓ backend_generator')"
+          python -c "from frontend_generator import FrontendGenerator; print('✓ frontend_generator')"
+          python -c "from product_assembly import ProductAssemblyManager; print('✓ product_assembly')"
+          python -c "from orchestrator import BlindOrchestrator; print('✓ orchestrator')"
+          python -c "from engineer import CodeEngineer; print('✓ engineer')"
+
+      - name: Run static-product detection tests
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python -c "
+          from story_translator import StoryTranslator
+          st = StoryTranslator()
+
+          # Static product must NOT trigger backend
+          story = {'id': 's1', 'name': 'Ad', 'description': 'one page html promotional flyer', 'success_criteria': []}
+          bs, _ = st.translate_story(story, {})
+          assert not bs.requires_backend, 'FAIL: flyer should be static'
+          print('✓ static product detected correctly')
+
+          # Dynamic product MUST trigger backend
+          story2 = {'id': 's2', 'name': 'App', 'description': 'user login and task management', 'success_criteria': ['user can login', 'user can create tasks']}
+          bs2, _ = st.translate_story(story2, {})
+          assert bs2.requires_backend, 'FAIL: app should need backend'
+          print('✓ dynamic product detected correctly')
+          "
+
+      - name: Run state tests
+        run: python -m pytest test_state.py -v --tb=short || true
+
+      - name: Smoke test product generation (no LLM)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python -c "
+          import asyncio
+          from product_generator import ProductGenerator, ProductGeneratorConfig
+
+          config = ProductGeneratorConfig(
+              llm_model='openrouter/meta-llama/llama-3.3-70b-instruct:free',
+              api_key='${{ secrets.OPENROUTER_API_KEY }}',
+              run_tests=False,
+              worker_pool_size=1
+          )
+          gen = ProductGenerator(config=config, product_dir='/tmp/vf_test')
+          stories = [{
+              'id': 'story_001',
+              'name': 'Test Page',
+              'description': 'one page html promotional flyer for a coffee shop',
+              'depends_on': [],
+              'success_criteria': ['page displays menu']
+          }]
+          path = asyncio.run(gen.generate_product('ci-test', stories, {}))
+          print(f'✓ Product generated at: {path}')
+
+          import os
+          files = []
+          for root, dirs, fnames in os.walk(path):
+              for f in fnames:
+                  files.append(os.path.relpath(os.path.join(root, f), path))
+          print('Generated files:')
+          for f in sorted(files): print(f'  {f}')
+
+          # A static product must NOT have backend files
+          backend_files = [f for f in files if 'backend' in f or 'main.py' in f or 'models.py' in f]
+          assert not backend_files, f'FAIL: static product should have no backend, got: {backend_files}'
+          print('✓ No backend generated for static product')
+          "
