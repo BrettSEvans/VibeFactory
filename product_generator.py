@@ -180,15 +180,23 @@ Provide validation results."""
     async def generate_product(
         self,
         project_id: str,
-        stories: List[Story],
+        stories: Optional[List[Story]] = None,
+        frontend_stories: Optional[List[Story]] = None,
+        backend_stories: Optional[List[Story]] = None,
         context_docs: Optional[Dict[str, str]] = None,
     ) -> str:
         """
         Generate complete product from stories.
 
+        TWO-TRACK GENERATION:
+        - TRACK 1 (Frontend): One-shot generation from PRD only
+        - TRACK 2 (Backend): Per-story generation from story.llm_prompt + TRD tech_stack
+
         Args:
             project_id: Unique project identifier
-            stories: List of Story objects (with embedded LLM prompts)
+            stories: Legacy parameter - List of Story objects (backward compatibility)
+            frontend_stories: Frontend stories generated from PRD only
+            backend_stories: Backend stories generated from TRD only
             context_docs: Optional context documents (PRD, TRD)
 
         Returns:
@@ -197,6 +205,11 @@ Provide validation results."""
         print("\n" + "=" * 70)
         print(f"PRODUCT GENERATION: {project_id}")
         print("=" * 70)
+
+        # Backward compatibility: if legacy stories parameter is provided, use it
+        if stories and not frontend_stories and not backend_stories:
+            frontend_stories = stories
+            backend_stories = stories
 
         # Initialize product assembly manager with context docs for PRD-based README
         product = ProductAssemblyManager(
@@ -211,28 +224,65 @@ Provide validation results."""
             if trd_content:
                 self.story_translator.trd_content = trd_content
 
-        # Determine if any story needs a backend (used to decide scaffold type)
-        product_needs_backend = self._product_needs_backend(stories, context_docs)
+        # Determine if product needs backend (check backend_stories)
+        product_needs_backend = backend_stories and len(backend_stories) > 0
         if product_needs_backend:
             product.initialize_product_structure()
         else:
-            # Static products (ads, flyers, promos): only a bare frontend dir.
-            # NO nav.js / api.js / pages/ scaffold — the generator writes a single index.html.
+            # Static products: only a bare frontend dir
             product.frontend_dir.mkdir(parents=True, exist_ok=True)
 
-        # Execute stories with dependency resolution
-        completed_ids = await self._execute_stories_sequential(
-            stories,
-            product,
-            context_docs
-        )
+        # TRACK 1: One-shot frontend generation from PRD
+        print("\n[1/4] Generating Frontend from PRD (one-shot)...")
+        prd_content = context_docs.get("PRD", "") if context_docs else ""
+        frontend_code = await self._generate_frontend_from_prd(prd_content)
 
-        # Export final product (export_product handles navigation update internally)
-        print("\n[4/5] Exporting Product...")
+        # Add frontend code to product
+        for file_path, content in frontend_code.items():
+            product.add_frontend_component("_frontend_track", file_path, content)
+
+        # TRACK 2: Per-story backend generation from llm_prompt
+        if product_needs_backend and backend_stories:
+            print(f"\n[2/4] Generating Backend for {len(backend_stories)} stories (per-story)...")
+            completed_ids = await self._execute_stories_sequential(
+                backend_stories,
+                product,
+                context_docs
+            )
+        else:
+            completed_ids = set()
+
+        # Export final product
+        print("\n[3/4] Exporting Product...")
         export_path = product.export_product()
         print(f"  ✓ Product exported to: {export_path}")
 
         return export_path
+
+    async def _generate_frontend_from_prd(self, prd_content: str) -> Dict[str, str]:
+        """
+        Generate frontend code directly from PRD (TRACK 1).
+        One-shot generation with zero story context.
+
+        Args:
+            prd_content: Complete PRD text
+
+        Returns:
+            Dictionary of frontend files (path -> content)
+        """
+        if not prd_content:
+            print("  ⚠ No PRD available, using fallback frontend")
+            return {"index.html": self.frontend_generator._generate_fallback_frontend()}
+
+        try:
+            # TRACK 1: One-shot frontend generation from PRD only
+            frontend_code = self.frontend_generator.generate_from_prd(prd_content)
+            frontend_files = self.frontend_generator.write_prd_frontend(frontend_code)
+            print(f"  ✓ Frontend generated: {len(frontend_files)} files")
+            return frontend_files
+        except Exception as e:
+            print(f"  ⚠ Frontend generation failed ({type(e).__name__}), using fallback")
+            return {"index.html": self.frontend_generator._generate_fallback_frontend()}
 
     async def _execute_stories_sequential(
         self,
@@ -322,15 +372,15 @@ Provide validation results."""
         total_stories: int = 0,
     ) -> StoryGeneration:
         """
-        Generate backend and frontend code for a single story.
+        Generate backend code for a single story (TRACK 2 - Backend only).
 
-        Uses the story's embedded llm_prompt to guide code generation directly,
-        rather than trying to infer complexity.
+        Uses the story's embedded llm_prompt directly for code generation,
+        bypassing story_translator for pure LLM-prompt-based generation.
 
         Args:
             story: Story object with embedded LLM prompt for code generators
             product: ProductAssemblyManager instance
-            context_docs: Optional context documents
+            context_docs: Optional context documents (PRD, TRD)
             story_index: 1-based position of this story in the full list
             total_stories: Total number of stories being generated
 
@@ -356,58 +406,49 @@ Provide validation results."""
         )
 
         try:
-            # Step 1: Translate story to specifications
+            # TRACK 2: Backend-only generation from story.llm_prompt
+            # Step 1: Extract tech stack from TRD
             result.status = ProductGenerationStatus.TRANSLATING
-            _cb("🔄 Translating story to specs")
-            backend_spec, frontend_spec = self.story_translator.translate_story(
-                story, context_docs
-            )
-            result.backend_spec = backend_spec
-            result.frontend_spec = frontend_spec
+            _cb("🔄 Extracting tech stack from TRD")
 
-            # Step 2: Generate backend code (skip for static products)
+            trd_content = context_docs.get("TRD", "") if context_docs else ""
+            tech_stack = self.backend_generator.extract_tech_stack(trd_content)
+
+            # Step 2: Generate backend code directly from llm_prompt + tech_stack
             result.status = ProductGenerationStatus.GENERATING_BACKEND
-            if backend_spec.requires_backend:
-                _cb("⚙️ Generating backend code")
-                backend_code = self.backend_generator.integrate_with_product(
-                    backend_spec, "", context_docs
-                )
-            else:
-                backend_code = {}
+            _cb("⚙️ Executing story prompt")
+            backend_code_obj = self.backend_generator.execute_story_prompt(
+                story.llm_prompt,
+                tech_stack
+            )
+
+            # Convert GeneratedBackendCode to file dictionary
+            backend_code = {}
+            backend_code["app/models.py"] = backend_code_obj.models_py
+            backend_code["app/routes.py"] = backend_code_obj.main_py_endpoints
+            backend_code["tests/conftest.py"] = backend_code_obj.conftest_py
+            backend_code["tests/test_routes.py"] = backend_code_obj.test_routes_py
+            backend_code["requirements.txt"] = backend_code_obj.requirements_txt
             result.backend_code = backend_code
 
-            # Step 3: Generate frontend code
-            result.status = ProductGenerationStatus.GENERATING_FRONTEND
-            _cb("🎨 Generating frontend code")
-            frontend_code = self.frontend_generator.integrate_with_product(
-                frontend_spec, "", context_docs
-            )
-            result.frontend_code = frontend_code
-
-            # Step 4: Assemble into product
+            # Step 3: Assemble backend code into product
             result.status = ProductGenerationStatus.ASSEMBLING
             for file_path, content in backend_code.items():
                 product.add_backend_code(story_id, file_path, content)
 
-            for file_path, content in frontend_code.items():
-                product.add_frontend_component(story_id, file_path, content)
-
-            # Register pages
-            for page in frontend_spec.pages:
-                product.add_frontend_page(story_id, page.name, page.route)
-
-            # Register endpoints
-            for endpoint in backend_spec.endpoints:
-                endpoint_spec = {
-                    "method": endpoint.method.value,
-                    "path": endpoint.path,
-                    "name": endpoint.name,
-                    "description": endpoint.description,
+            # Register story with basic info
+            product.register_story(
+                story_id,
+                {
+                    "name": story_name,
+                    "description": story.description,
+                    "endpoints": [],  # Would need to parse from llm_prompt or code
+                    "pages": [],  # Frontend is separate (TRACK 1)
                 }
-                product.add_api_endpoint(story_id, endpoint_spec)
+            )
 
-            # Step 5: Run tests (if configured and backend exists)
-            if self.config.run_tests and self.sandbox and backend_spec.requires_backend and backend_code:
+            # Step 4: Run tests (if configured)
+            if self.config.run_tests and self.sandbox and backend_code:
                 result.status = ProductGenerationStatus.TESTING
                 test_result = await self._run_story_tests(
                     story_id, backend_code
@@ -418,17 +459,6 @@ Provide validation results."""
                     result.status = ProductGenerationStatus.FAILED
                     result.error_message = f"Tests failed: {test_result.stderr}"
                     return result
-
-            # Step 6: Register story in product
-            product.register_story(
-                story_id,
-                {
-                    "name": story_name,
-                    "description": story.description,
-                    "endpoints": [e.path for e in backend_spec.endpoints],
-                    "pages": [p.route for p in frontend_spec.pages],
-                }
-            )
 
             result.status = ProductGenerationStatus.COMPLETED
             _cb("✅ Done")

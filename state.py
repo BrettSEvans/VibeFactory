@@ -190,3 +190,193 @@ class ProjectState(BaseModel):
     def from_json(cls, json_str: str) -> "ProjectState":
         """Deserialize JSON string to ProjectState."""
         return cls.model_validate_json(json_str)
+
+
+def stories_to_markdown(stories: List[Story]) -> str:
+    """
+    Serialize a list of Story objects to markdown format.
+
+    Args:
+        stories: List of Story objects to serialize
+
+    Returns:
+        Markdown string representation of stories
+    """
+    lines = []
+    for story in stories:
+        # Story header
+        lines.append(f"## Story {story.id}: {story.name}")
+        lines.append(f"**Sequence:** {story.sequence_order}")
+
+        # Dependencies
+        if story.depends_on:
+            deps = ", ".join(story.depends_on)
+            lines.append(f"**Depends On:** {deps}")
+        else:
+            lines.append("**Depends On:** none")
+
+        # Tech suggestions
+        if story.tech_suggestions:
+            tech_str = ", ".join([f"{k}={v}" for k, v in story.tech_suggestions.items()])
+            lines.append(f"**Tech:** {tech_str}")
+
+        # LLM Prompt section
+        lines.append("")
+        lines.append("### LLM Prompt")
+        lines.append(story.llm_prompt)
+
+        # Success Criteria section
+        lines.append("")
+        lines.append("### Success Criteria")
+        if story.success_criteria:
+            for criterion in story.success_criteria:
+                lines.append(f"- {criterion}")
+        else:
+            lines.append("- No criteria specified")
+
+        # Section divider
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def stories_from_markdown(md: str) -> List[Story]:
+    """
+    Deserialize stories from markdown format back to Story objects.
+
+    Args:
+        md: Markdown string containing serialized stories
+
+    Returns:
+        List of Story objects
+    """
+    stories = []
+
+    # Split by story headers (## Story ID: Name)
+    import re
+    story_blocks = re.split(r"^## Story ", md, flags=re.MULTILINE)
+
+    # First element is empty or preamble, skip it
+    for block in story_blocks[1:]:
+        if not block.strip():
+            continue
+
+        lines = block.split("\n")
+
+        # Parse header (first line has "ID: Name")
+        header_line = lines[0]
+        match = re.match(r"([^:]+):\s*(.*)", header_line)
+        if not match:
+            continue
+
+        story_id = match.group(1).strip()
+        story_name = match.group(2).strip()
+
+        # Initialize story data
+        story_data = {
+            "id": story_id,
+            "name": story_name,
+            "description": "",
+            "llm_prompt": "",
+            "success_criteria": [],
+            "tech_suggestions": {},
+            "depends_on": [],
+            "sequence_order": 0
+        }
+
+        # Parse remaining metadata and sections
+        current_section = None
+        section_content = []
+
+        for line in lines[1:]:
+            line_stripped = line.strip()
+
+            # Check for metadata lines (with ** markdown bold markers)
+            if line_stripped.startswith("**Sequence:**"):
+                try:
+                    value_str = line_stripped.replace("**Sequence:**", "").strip()
+                    story_data["sequence_order"] = int(value_str)
+                except ValueError:
+                    pass
+
+            elif line_stripped.startswith("**Depends On:**"):
+                value_str = line_stripped.replace("**Depends On:**", "").strip()
+                if value_str.lower() != "none":
+                    story_data["depends_on"] = [d.strip() for d in value_str.split(",")]
+                else:
+                    story_data["depends_on"] = []
+
+            elif line_stripped.startswith("**Tech:**"):
+                tech_str = line_stripped.replace("**Tech:**", "").strip()
+                # Parse tech_suggestions as key=value pairs
+                for pair in tech_str.split(","):
+                    pair = pair.strip()
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        story_data["tech_suggestions"][k.strip()] = v.strip()
+
+            # Check for section headers
+            elif line_stripped.startswith("### LLM Prompt"):
+                if current_section and section_content:
+                    _store_section(story_data, current_section, section_content)
+                current_section = "llm_prompt"
+                section_content = []
+
+            elif line_stripped.startswith("### Success Criteria"):
+                if current_section and section_content:
+                    _store_section(story_data, current_section, section_content)
+                current_section = "success_criteria"
+                section_content = []
+
+            elif line_stripped == "---":
+                if current_section and section_content:
+                    _store_section(story_data, current_section, section_content)
+                break
+
+            # Accumulate section content (only if not a metadata line)
+            elif current_section and line.strip() and not line_stripped.startswith("**"):
+                section_content.append(line)
+
+        # Store final section if exists
+        if current_section and section_content:
+            _store_section(story_data, current_section, section_content)
+
+        # Create Story object
+        try:
+            story = Story(**story_data)
+            stories.append(story)
+        except Exception:
+            # Skip malformed stories
+            continue
+
+    return stories
+
+
+def _store_section(story_data: dict, section: str, content: List[str]) -> None:
+    """
+    Helper to store parsed section content into story_data dict.
+
+    Args:
+        story_data: Dict to update
+        section: Section name ("llm_prompt" or "success_criteria")
+        content: List of content lines from the section
+    """
+    if section == "llm_prompt":
+        story_data["llm_prompt"] = "\n".join(content).strip()
+    elif section == "success_criteria":
+        # Parse bullet points
+        criteria = []
+        for line in content:
+            line = line.strip()
+            if line.startswith("- "):
+                criteria.append(line[2:].strip())
+            elif line and not line.startswith("#"):
+                # Add non-empty lines that aren't headers
+                if criteria and line:
+                    criteria[-1] += " " + line
+        # Filter out placeholder and empty strings
+        story_data["success_criteria"] = [
+            c for c in criteria
+            if c and c != "No criteria specified"
+        ]

@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from state import ProjectState, Document, Story
+from state import ProjectState, Document, Story, stories_from_markdown
 from orchestrator import BlindOrchestrator, OrchestratorConfig, Phase
 from product_generator import ProductGenerator, ProductGeneratorConfig
 from local_config import OLLAMA_HOST
@@ -864,25 +864,16 @@ async def serve_ui():
                 // Destroy previous EasyMDE instance if any
                 if (easyMDE) { try { easyMDE.toTextArea(); } catch(e) {} easyMDE = null; }
 
-                const isJson = (phase === 'STORIES');
-                if (isJson) {
-                    // Plain textarea for JSON
-                    const ta = document.getElementById('documentEditor');
-                    ta.style.display = 'block';
-                    ta.value = docContent;
-                } else {
-                    // Hide raw textarea — EasyMDE renders its own
-                    document.getElementById('documentEditor').style.display = 'none';
-                    // Re-show it first (EasyMDE needs the element visible)
-                    document.getElementById('documentEditor').style.display = 'block';
-                    easyMDE = new EasyMDE({
-                        element: document.getElementById('documentEditor'),
-                        initialValue: docContent,
-                        spellChecker: false,
-                        autosave: { enabled: false },
-                        toolbar: ['bold','italic','heading','|','quote','unordered-list','ordered-list','|','preview','side-by-side','fullscreen'],
-                    });
-                }
+                // All documents use EasyMDE markdown editor now
+                // (STORIES was converted from JSON to markdown format)
+                document.getElementById('documentEditor').style.display = 'block';
+                easyMDE = new EasyMDE({
+                    element: document.getElementById('documentEditor'),
+                    initialValue: docContent,
+                    spellChecker: false,
+                    autosave: { enabled: false },
+                    toolbar: ['bold','italic','heading','|','quote','unordered-list','ordered-list','|','preview','side-by-side','fullscreen'],
+                });
                 document.getElementById('reviewPanel').scrollIntoView({ behavior: 'smooth' });
             }
 
@@ -1291,35 +1282,21 @@ async def _run_generation_task(
             for doc_type in ["BRD", "PRD", "TRD", "STORIES"]:
                 doc = project_state.docs.get(doc_type)
                 if doc and doc.content:
-                    ext = ".json" if doc_type == "STORIES" else ".md"
+                    # All documents are now markdown format
+                    ext = ".md"
                     (docs_dir / f"{doc_type}{ext}").write_text(doc.content)
                     context_docs[doc_type] = doc.content
                     logger.info(f"Saved {doc_type} ({len(doc.content)} chars)")
 
-            # Parse stories from the STORIES document JSON
+            # Parse stories from the STORIES document (markdown format)
             stories_doc = project_state.docs.get("STORIES")
             if stories_doc and stories_doc.content:
                 try:
-                    content = stories_doc.content
-                    # Strip markdown code fences if present
-                    if content.strip().startswith("```"):
-                        # Remove ```json or ``` from start
-                        content = content.strip()
-                        if content.startswith("```json"):
-                            content = content[7:]  # Remove ```json
-                        elif content.startswith("```"):
-                            content = content[3:]  # Remove ```
-                        # Remove closing ```
-                        if content.endswith("```"):
-                            content = content[:-3]
-                        content = content.strip()
-
-                    stories_data = json.loads(content)
-                    # Convert to Story objects
-                    stories = [Story(**story) for story in stories_data]
+                    # Parse markdown format stories
+                    stories = stories_from_markdown(stories_doc.content)
                     logger.info(f"✓ Parsed {len(stories)} stories from STORIES doc")
-                except (json.JSONDecodeError, ValueError, Exception) as e:
-                    logger.warning(f"⚠ Could not parse STORIES as Story objects ({type(e).__name__}: {str(e)[:100]}); using single-story fallback")
+                except Exception as e:
+                    logger.warning(f"⚠ Could not parse STORIES markdown ({type(e).__name__}: {str(e)[:100]}); using single-story fallback")
                     stories = None
 
         # ── Fallback: single story if docs skipped or STORIES parse failed ──
