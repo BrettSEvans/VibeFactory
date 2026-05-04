@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from state import ProjectState, Document, Story
+from state import ProjectState, Document, Story, stories_from_markdown
 from orchestrator import BlindOrchestrator, OrchestratorConfig, Phase
 from product_generator import ProductGenerator, ProductGeneratorConfig
 from local_config import OLLAMA_HOST
@@ -864,14 +864,21 @@ async def serve_ui():
                 // Destroy previous EasyMDE instance if any
                 if (easyMDE) { try { easyMDE.toTextArea(); } catch(e) {} easyMDE = null; }
 
-                const isJson = (phase === 'STORIES');
-                if (isJson) {
-                    // Plain textarea for JSON
+                // Display-only mode for ARCHITECT_REVIEW (no editing)
+                const isDisplayOnly = (phase === 'ARCHITECT_REVIEW');
+                const approveBtn = document.getElementById('approveBtn');
+
+                if (isDisplayOnly) {
+                    // Display-only mode: show content, disable editing
+                    approveBtn.textContent = '✅ Confirmed - Continue to Code Generation';
                     const ta = document.getElementById('documentEditor');
                     ta.style.display = 'block';
                     ta.value = docContent;
+                    ta.disabled = true;
+                    ta.style.height = '300px';
                 } else {
-                    // Hide raw textarea — EasyMDE renders its own
+                    // Editable mode: use EasyMDE for all story phases
+                    approveBtn.textContent = '✅ Approve & Continue';
                     document.getElementById('documentEditor').style.display = 'none';
                     // Re-show it first (EasyMDE needs the element visible)
                     document.getElementById('documentEditor').style.display = 'block';
@@ -1269,61 +1276,93 @@ async def _run_generation_task(
                 trd_doc.content = approved_trd
                 trd_doc.status = "approved"
 
-            # Stories
-            await update_progress(project_id, "Stories", 50,
-                "📖 Breaking down User Stories...", "in_progress")
+            # ── DUAL STORY SETS GENERATION (Revised approach) ──
+            # Phase 1: Frontend Stories (from PRD only)
+            await update_progress(project_id, "Frontend Stories", 50,
+                "📖 Generating Frontend Stories from PRD...", "in_progress")
             await asyncio.sleep(0)
             await loop.run_in_executor(
-                None, lambda: orchestrator.orchestrate_phase(Phase.STORIES)
+                None, lambda: orchestrator.orchestrate_phase(Phase.FRONTEND_STORIES)
             )
-            # HITL: pause for STORIES review
-            stories_hitl_doc = project_state.docs.get("STORIES")
-            if stories_hitl_doc and stories_hitl_doc.content:
-                approved_stories = await wait_for_human_approval(
-                    project_id, "STORIES", stories_hitl_doc.content, 55
+            # HITL: pause for Frontend Stories review
+            frontend_stories_doc = project_state.docs.get("FRONTEND_STORIES")
+            if frontend_stories_doc and frontend_stories_doc.content:
+                approved_frontend_stories = await wait_for_human_approval(
+                    project_id, "FRONTEND_STORIES", frontend_stories_doc.content, 55
                 )
-                stories_hitl_doc.content = approved_stories
-                stories_hitl_doc.status = "approved"
+                frontend_stories_doc.content = approved_frontend_stories
+                frontend_stories_doc.status = "approved"
+
+            # Phase 2: Backend Stories (from TRD only)
+            await update_progress(project_id, "Backend Stories", 60,
+                "🏗️ Generating Backend Stories from TRD...", "in_progress")
+            await asyncio.sleep(0)
+            await loop.run_in_executor(
+                None, lambda: orchestrator.orchestrate_phase(Phase.BACKEND_STORIES)
+            )
+            # HITL: pause for Backend Stories review
+            backend_stories_doc = project_state.docs.get("BACKEND_STORIES")
+            if backend_stories_doc and backend_stories_doc.content:
+                approved_backend_stories = await wait_for_human_approval(
+                    project_id, "BACKEND_STORIES", backend_stories_doc.content, 65
+                )
+                backend_stories_doc.content = approved_backend_stories
+                backend_stories_doc.status = "approved"
+
+            # Phase 3: Architect Review (validates separation and dependencies)
+            await update_progress(project_id, "Architect Review", 70,
+                "👨‍💼 Architect reviewing story coherence...", "in_progress")
+            await asyncio.sleep(0)
+            await loop.run_in_executor(
+                None, lambda: orchestrator.orchestrate_phase(Phase.ARCHITECT_REVIEW)
+            )
+            # HITL: pause for Architect Review (display-only, user confirms)
+            architect_review_doc = project_state.docs.get("ARCHITECT_REVIEW")
+            if architect_review_doc and architect_review_doc.content:
+                await wait_for_human_approval(
+                    project_id, "ARCHITECT_REVIEW", architect_review_doc.content, 72
+                )
+                architect_review_doc.status = "approved"
 
             # Save docs to disk inside the product directory
             docs_dir = Path(f"./products/{project_id}/docs")
             docs_dir.mkdir(parents=True, exist_ok=True)
-            for doc_type in ["BRD", "PRD", "TRD", "STORIES"]:
+            for doc_type in ["BRD", "PRD", "TRD", "FRONTEND_STORIES", "BACKEND_STORIES", "ARCHITECT_REVIEW"]:
                 doc = project_state.docs.get(doc_type)
                 if doc and doc.content:
-                    ext = ".json" if doc_type == "STORIES" else ".md"
+                    ext = ".md"  # All stories now in markdown format
                     (docs_dir / f"{doc_type}{ext}").write_text(doc.content)
                     context_docs[doc_type] = doc.content
                     logger.info(f"Saved {doc_type} ({len(doc.content)} chars)")
 
-            # Parse stories from the STORIES document JSON
-            stories_doc = project_state.docs.get("STORIES")
-            if stories_doc and stories_doc.content:
+            # Parse frontend and backend stories from markdown
+            frontend_stories = []
+            backend_stories = []
+
+            frontend_stories_doc = project_state.docs.get("FRONTEND_STORIES")
+            if frontend_stories_doc and frontend_stories_doc.content:
                 try:
-                    content = stories_doc.content
-                    # Strip markdown code fences if present
-                    if content.strip().startswith("```"):
-                        # Remove ```json or ``` from start
-                        content = content.strip()
-                        if content.startswith("```json"):
-                            content = content[7:]  # Remove ```json
-                        elif content.startswith("```"):
-                            content = content[3:]  # Remove ```
-                        # Remove closing ```
-                        if content.endswith("```"):
-                            content = content[:-3]
-                        content = content.strip()
+                    frontend_stories = stories_from_markdown(frontend_stories_doc.content)
+                    logger.info(f"✓ Parsed {len(frontend_stories)} frontend stories")
+                except Exception as e:
+                    logger.warning(f"⚠ Could not parse frontend stories ({type(e).__name__}: {str(e)[:100]})")
+                    frontend_stories = []
 
-                    stories_data = json.loads(content)
-                    # Convert to Story objects
-                    stories = [Story(**story) for story in stories_data]
-                    logger.info(f"✓ Parsed {len(stories)} stories from STORIES doc")
-                except (json.JSONDecodeError, ValueError, Exception) as e:
-                    logger.warning(f"⚠ Could not parse STORIES as Story objects ({type(e).__name__}: {str(e)[:100]}); using single-story fallback")
-                    stories = None
+            backend_stories_doc = project_state.docs.get("BACKEND_STORIES")
+            if backend_stories_doc and backend_stories_doc.content:
+                try:
+                    backend_stories = stories_from_markdown(backend_stories_doc.content)
+                    logger.info(f"✓ Parsed {len(backend_stories)} backend stories")
+                except Exception as e:
+                    logger.warning(f"⚠ Could not parse backend stories ({type(e).__name__}: {str(e)[:100]})")
+                    backend_stories = []
 
-        # ── Fallback: single story if docs skipped or STORIES parse failed ──
-        if not stories:
+            # Fallback: if both story sets are empty, create synthetic stories
+            if not frontend_stories and not backend_stories:
+                stories = None  # Will use single-story fallback below
+
+        # ── Fallback: single story if docs skipped or story parsing failed ──
+        if not frontend_stories and not backend_stories:
             story_name = rough_idea.strip().rstrip('.').title()
             if len(story_name) > 60:
                 story_name = story_name[:57] + "..."
@@ -1336,16 +1375,17 @@ async def _run_generation_task(
 Create the complete implementation (both backend and frontend as needed) that matches this description.
 Ensure the code is production-ready, includes error handling, and is well-documented."""
 
-            stories = [Story(
-                id="story_001",
-                name=story_name,
-                description=rough_idea,
+            frontend_stories = [Story(
+                id="F1",
+                name=f"{story_name} Frontend",
+                description="",
                 llm_prompt=llm_prompt,
-                tech_suggestions={},  # Will be determined by code generators
+                tech_suggestions={},
                 depends_on=[],
                 sequence_order=1,
                 success_criteria=["Implementation complete"],
             )]
+            backend_stories = []  # No backend stories in fallback
 
         # ── Code generation phase ──────────────────────────────────────────────
         # Determine provider label based on actual provider (not LiteLLM format)
@@ -1353,13 +1393,14 @@ Ensure the code is production-ready, includes error handling, and is well-docume
             provider_label = "Inception Mercury-2"
         else:
             provider_label = llm_model.split("/")[0].capitalize()
-        await update_progress(project_id, "Code", 55,
+        await update_progress(project_id, "Code", 75,
             f"⚙️ Generating code with {provider_label}...", "in_progress")
         await asyncio.sleep(0)
 
         # Build a thread-safe story-progress callback
+        total_stories = len(frontend_stories) + len(backend_stories)
         def _story_callback(story_index: int, total_stories: int, story_name: str, status_msg: str):
-            pct = 60 + int(30 * story_index / max(total_stories, 1))
+            pct = 75 + int(20 * story_index / max(total_stories, 1))
             msg = f"Story {story_index} of {total_stories} — {story_name}: {status_msg}"
             asyncio.run_coroutine_threadsafe(
                 update_progress(project_id, "Code", pct, msg, "in_progress"),
@@ -1377,9 +1418,11 @@ Ensure the code is production-ready, includes error handling, and is well-docume
         )
         generator = ProductGenerator(config=product_generator_config)
 
+        # Generate product with dual story sets
         product_path = await generator.generate_product(
             project_id=project_id,
-            stories=stories,
+            frontend_stories=frontend_stories,
+            backend_stories=backend_stories,
             context_docs=context_docs,
         )
 
