@@ -156,6 +156,59 @@ Requirements:
 
 Return JSON: {{ "pages": {{ "index.html": "<complete html>" }}, "components": {{}}, "styles": {{}}, "navigation_update": "" }}"""
 
+    PRD_FRONTEND_SYSTEM = """You are a Senior Frontend Developer generating a complete frontend application from PRD (Product Requirements Document).
+
+CRITICAL CONSTRAINTS:
+- You ONLY read the PRD — never read story names, story descriptions, or technical specs
+- You ONLY generate frontend code (HTML, CSS, JavaScript) for user-facing features
+- You MUST NOT include any backend integration, API calls, or technical infrastructure details
+- You MUST NOT reference backend technologies (FastAPI, SQLAlchemy, database schemas, etc.)
+- You MUST NOT include authentication UI elements unless explicitly mentioned in PRD vision/features
+
+FRONTEND GENERATION RULES:
+- Generate a complete, single-page application with proper navigation
+- Create semantic HTML5 with accessibility support (WCAG 2.1)
+- Use responsive CSS Grid/Flexbox for all layouts
+- Write vanilla JavaScript (no frameworks) with proper error handling
+- Generate multiple interconnected pages with working navigation
+- Include proper form validation and user feedback
+- Support dark/light mode with CSS custom properties
+- All code must be production-ready with no TODOs or placeholders
+
+OUTPUT FORMAT:
+Return JSON with exactly these keys:
+{
+  "pages": {"page_name.html": "<complete HTML>"},
+  "components": {"component_name.js": "<vanilla JavaScript>"},
+  "styles": {"component_name.css": "<CSS>"},
+  "navigation_update": "<registration code>"
+}"""
+
+    PRD_FRONTEND_USER = """Generate a complete frontend application from this PRD ONLY. Do NOT reference any story context, technical requirements, or backend details.
+
+PRODUCT REQUIREMENTS DOCUMENT:
+{prd_content}
+
+GENERATION INSTRUCTIONS:
+1. Extract the product vision and user-facing features from the PRD
+2. Design a complete frontend experience with:
+   - Multiple pages reflecting different user journeys mentioned in PRD
+   - Forms for data entry/user interaction (if applicable)
+   - Display components for content presentation
+   - Proper navigation between pages
+3. Generate production-ready code:
+   - Semantic HTML5 with proper structure
+   - Responsive CSS with mobile-first approach
+   - Vanilla JavaScript with fetch() API for any external calls
+   - Proper error handling and loading states
+4. Ensure NO backend-specific details appear in the code:
+   - No API endpoint hardcoding (use placeholder routes)
+   - No database schema references
+   - No authentication tokens or JWT references
+   - No backend technology names
+
+Return valid JSON with pages, components, styles, and navigation_update keys."""
+
     def __init__(self, config: Optional[FrontendGeneratorConfig] = None):
         """Initialize the frontend generator."""
         self.config = config or FrontendGeneratorConfig()
@@ -276,6 +329,172 @@ Return JSON: {{ "pages": {{ "index.html": "<complete html>" }}, "components": {{
                 styles=styles,
                 navigation_update=navigation_code,
             )
+
+    def generate_from_prd(
+        self,
+        prd_content: str,
+        max_retries: int = 3,
+        timeout_seconds: int = 120
+    ) -> GeneratedFrontendCode:
+        """
+        Generate complete frontend from PRD in a single LLM call.
+        TRACK 1: One-shot frontend generation, PRD-only context.
+
+        Args:
+            prd_content: Complete PRD text (no story data)
+            max_retries: Maximum retry attempts for rate limits
+            timeout_seconds: LLM request timeout
+
+        Returns:
+            GeneratedFrontendCode with all frontend files
+        """
+        for attempt in range(max_retries):
+            try:
+                user_prompt = self.PRD_FRONTEND_USER.format(prd_content=prd_content)
+
+                completion_kwargs = {
+                    "model": self.config.llm_model,
+                    "messages": [
+                        {"role": "system", "content": self.PRD_FRONTEND_SYSTEM},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "response_model": GeneratedFrontendCode,
+                    "api_key": self.api_key,
+                    "timeout": timeout_seconds,
+                    "max_retries": 0,  # Manual retries with exponential backoff
+                }
+                if self.config.api_base:
+                    completion_kwargs["api_base"] = self.config.api_base
+
+                logger.info(f"PRD frontend generation attempt {attempt + 1}/{max_retries}")
+                response = self.client.create(**completion_kwargs)
+                return response
+
+            except Exception as e:
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "rate" in error_str.lower() or "quota" in error_str.lower()
+                is_timeout = "timeout" in error_str.lower() or "deadline" in error_str.lower()
+
+                if attempt < max_retries - 1:
+                    if is_rate_limit:
+                        wait_time = [20, 60][min(attempt, 1)]
+                    elif is_timeout:
+                        wait_time = [10, 30][min(attempt, 1)]
+                    else:
+                        wait_time = [15, 45][min(attempt, 1)]
+
+                    logger.warning(f"⚠ PRD frontend LLM attempt {attempt + 1} failed ({type(e).__name__}). "
+                                 f"Retrying in {wait_time}s...")
+                    print(f"⚠ PRD frontend generation attempt {attempt + 1} failed. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.warning(f"⚠ PRD frontend LLM failed after {max_retries} attempts, using fallback")
+                    print(f"⚠ PRD frontend generation failed after {max_retries} attempts, using fallback")
+
+        # Fallback: Generate minimal frontend structure
+        fallback_html = self._generate_fallback_frontend()
+        return GeneratedFrontendCode(
+            pages={"index.html": fallback_html},
+            components={},
+            styles={},
+            navigation_update="",
+        )
+
+    def write_prd_frontend(self, code: GeneratedFrontendCode) -> Dict[str, str]:
+        """
+        Write PRD-generated frontend code to files.
+        Returns file mapping ready for ProductAssemblyManager.
+
+        Args:
+            code: GeneratedFrontendCode from generate_from_prd()
+
+        Returns:
+            Dictionary mapping file paths to content
+        """
+        files = {}
+
+        # Main index page
+        if "index.html" in code.pages:
+            files["index.html"] = code.pages["index.html"]
+        else:
+            # Use first page as index
+            files["index.html"] = next(iter(code.pages.values()), "")
+
+        # Additional pages
+        for filename, content in code.pages.items():
+            if filename != "index.html":
+                files[f"pages/{filename}"] = content
+
+        # Components
+        for filename, content in code.components.items():
+            files[f"components/{filename}"] = content
+
+        # Styles
+        for filename, content in code.styles.items():
+            files[f"styles/{filename}"] = content
+
+        # Navigation registration
+        if code.navigation_update:
+            files["js/nav-registration.js"] = code.navigation_update
+
+        return files
+
+    def _generate_fallback_frontend(self) -> str:
+        """Generate minimal fallback frontend when LLM fails."""
+        html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Application</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+        }
+        nav {
+            background: white;
+            padding: 1rem 2rem;
+            border-bottom: 1px solid #ddd;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        nav a {
+            margin-right: 2rem;
+            text-decoration: none;
+            color: #3498db;
+        }
+        nav a:hover { text-decoration: underline; }
+        main {
+            max-width: 1200px;
+            margin: 2rem auto;
+            padding: 0 2rem;
+        }
+        section {
+            background: white;
+            padding: 2rem;
+            border-radius: 8px;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        h1 { color: #2c3e50; margin-bottom: 1rem; }
+        p { line-height: 1.6; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <nav>
+        <a href="index.html">Home</a>
+    </nav>
+    <main>
+        <section>
+            <h1>Welcome</h1>
+            <p>Application frontend loaded successfully.</p>
+        </section>
+    </main>
+</body>
+</html>"""
+        return html
 
     def _generate_static_html(self, frontend_spec: FrontendSpec) -> 'GeneratedFrontendCode':
         """

@@ -106,6 +106,57 @@ Generate the following code files:
 
 Return valid JSON with keys: models_py, main_py_endpoints, conftest_py, test_routes_py, requirements_txt"""
 
+    EXECUTE_PROMPT_SYSTEM = """You are a Senior Python Backend Developer specializing in FastAPI.
+Your task is to generate production-quality code that directly implements the provided llm_prompt.
+
+CRITICAL CONSTRAINTS:
+- You ONLY read the llm_prompt — this is the explicit code generation instruction
+- Do NOT invent features beyond what's specified in the llm_prompt
+- Do NOT add unnecessary technical sophistication
+- Follow the llm_prompt EXACTLY as written
+
+PRODUCTION CODE STANDARDS:
+- SQLAlchemy ORM with SQLite (no raw SQL)
+- RESTful API design with proper HTTP methods and status codes
+- Pydantic for request/response validation
+- Type hints on all functions
+- Comprehensive pytest test coverage (80%+ code coverage)
+- Proper error handling and logging
+- No hardcoded secrets or credentials
+- CORS support for frontend integration
+
+OUTPUT: Generate complete, runnable FastAPI code with:
+1. SQLAlchemy ORM models (models.py)
+2. FastAPI endpoint implementations
+3. Pytest fixtures and test suite
+4. Updated requirements.txt
+
+Return valid JSON with these exact keys: models_py, main_py_endpoints, conftest_py, test_routes_py, requirements_txt"""
+
+    EXECUTE_PROMPT_USER = """Implement this feature exactly as specified in the LLM Prompt below.
+
+EXPLICIT CODE GENERATION PROMPT:
+{llm_prompt}
+
+TECHNOLOGY STACK:
+{tech_stack}
+
+IMPLEMENTATION REQUIREMENTS:
+1. Follow the llm_prompt instructions EXACTLY
+2. Use the specified tech stack (database, backend framework, etc.)
+3. Generate complete, production-ready code
+4. Include comprehensive test coverage
+5. Provide all dependencies in requirements.txt
+
+Generate FastAPI backend code with:
+- models.py: SQLAlchemy ORM models
+- endpoint implementations: FastAPI route handlers
+- conftest.py: Pytest fixtures and configuration
+- test_routes.py: Test suite with 80%+ coverage
+- requirements.txt: All Python package dependencies
+
+Return valid JSON with keys: models_py, main_py_endpoints, conftest_py, test_routes_py, requirements_txt"""
+
     def __init__(self, config: Optional[BackendGeneratorConfig] = None):
         """Initialize the backend generator."""
         self.config = config or BackendGeneratorConfig()
@@ -216,6 +267,160 @@ def test_db():
                 test_routes_py=test_routes_py,
                 requirements_txt=self.generate_requirements(backend_spec),
             )
+
+    def execute_story_prompt(
+        self,
+        llm_prompt: str,
+        tech_stack: Dict[str, str],
+        max_retries: int = 3,
+        timeout_seconds: int = 90
+    ) -> GeneratedBackendCode:
+        """
+        Execute a story's embedded LLM prompt for code generation.
+        TRACK 2: Per-story backend generation, llm_prompt-only context.
+
+        Args:
+            llm_prompt: Explicit code generation instruction from story
+            tech_stack: Dict of technology choices (backend_tech, database, auth, etc.)
+            max_retries: Maximum retry attempts for rate limits
+            timeout_seconds: LLM request timeout
+
+        Returns:
+            GeneratedBackendCode with all backend files
+        """
+        import time
+        import logging
+        logger = logging.getLogger(__name__)
+
+        for attempt in range(max_retries):
+            try:
+                # Format tech stack as readable string
+                tech_str = "\n".join([f"- {k}: {v}" for k, v in tech_stack.items()])
+
+                user_prompt = self.EXECUTE_PROMPT_USER.format(
+                    llm_prompt=llm_prompt,
+                    tech_stack=tech_str
+                )
+
+                completion_kwargs = {
+                    "model": self.config.llm_model,
+                    "messages": [
+                        {"role": "system", "content": self.EXECUTE_PROMPT_SYSTEM},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "response_model": GeneratedBackendCode,
+                    "api_key": self.api_key,
+                    "timeout": timeout_seconds,
+                    "max_retries": 0,  # Manual retries with exponential backoff
+                }
+
+                logger.info(f"Story prompt execution attempt {attempt + 1}/{max_retries}")
+                response = self.client.create(**completion_kwargs)
+                return response
+
+            except Exception as e:
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "rate" in error_str.lower() or "quota" in error_str.lower()
+                is_timeout = "timeout" in error_str.lower() or "deadline" in error_str.lower()
+
+                if attempt < max_retries - 1:
+                    if is_rate_limit:
+                        wait_time = [20, 60][min(attempt, 1)]
+                    elif is_timeout:
+                        wait_time = [10, 30][min(attempt, 1)]
+                    else:
+                        wait_time = [15, 45][min(attempt, 1)]
+
+                    logger.warning(f"⚠ Story prompt LLM attempt {attempt + 1} failed ({type(e).__name__}). "
+                                 f"Retrying in {wait_time}s...")
+                    print(f"⚠ Story prompt execution attempt {attempt + 1} failed. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.warning(f"⚠ Story prompt LLM failed after {max_retries} attempts, using fallback")
+                    print(f"⚠ Story prompt execution failed after {max_retries} attempts, using fallback")
+
+        # Fallback: Generate minimal code structure
+        fallback_code = self.generate_test_code(
+            type('MinimalSpec', (), {
+                'endpoints': [],
+                'models': [],
+                'dependencies': []
+            })()
+        )
+
+        return GeneratedBackendCode(
+            models_py="# Fallback models\nfrom sqlalchemy.ext.declarative import declarative_base\nBase = declarative_base()",
+            main_py_endpoints="# Fallback endpoints\nfrom fastapi import APIRouter\nrouter = APIRouter()",
+            conftest_py=fallback_code,
+            test_routes_py="# Fallback tests\nimport pytest",
+            requirements_txt="fastapi>=0.100.0\nuvicorn>=0.23.0\nsqlalchemy>=2.0.0\npydantic>=2.0.0\npytest>=7.0.0\n",
+        )
+
+    @staticmethod
+    def extract_tech_stack(trd: str) -> Dict[str, str]:
+        """
+        Extract technology stack from TRD content.
+        Looks for "Tech Stack Summary" section and parses key=value or key: value pairs.
+
+        Supports formats:
+        - key: value (with optional bullet point "- " prefix)
+        - key=value
+
+        Args:
+            trd: Complete TRD text
+
+        Returns:
+            Dictionary of technology choices (e.g., {"backend_tech": "FastAPI", ...})
+        """
+        tech_stack = {}
+
+        # Find "Tech Stack Summary" section
+        lines = trd.split('\n')
+        in_tech_section = False
+
+        for i, line in enumerate(lines):
+            # Look for Tech Stack Summary header
+            if 'Tech Stack Summary' in line or 'Technology Stack' in line:
+                in_tech_section = True
+                continue
+
+            if in_tech_section:
+                # Stop when we hit the next section header or blank line followed by header
+                if line.strip() and line.startswith('#') and ('Tech Stack' not in line and 'Technology Stack' not in line):
+                    break
+
+                # Parse key: value or key=value pairs (with optional bullet point)
+                if ':' in line or '=' in line:
+                    try:
+                        # Remove bullet point if present
+                        clean_line = line.strip()
+                        if clean_line.startswith('- '):
+                            clean_line = clean_line[2:]
+
+                        if '=' in clean_line:
+                            key, value = clean_line.split('=', 1)
+                        else:
+                            key, value = clean_line.split(':', 1)
+
+                        key = key.strip().lower().replace(' ', '_').replace('-', '_')
+                        value = value.strip()
+
+                        # Store key=value pair if both are non-empty
+                        if key and value:
+                            tech_stack[key] = value
+                    except ValueError:
+                        continue
+
+        # Provide defaults if extraction failed
+        if not tech_stack:
+            tech_stack = {
+                "backend_tech": "FastAPI",
+                "database": "SQLite",
+                "auth": "None",
+                "caching": "None"
+            }
+
+        return tech_stack
 
     def generate_models_code(self, backend_spec: BackendSpec) -> str:
         """

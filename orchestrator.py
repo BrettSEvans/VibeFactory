@@ -176,22 +176,45 @@ PRD: {prd_context}
 TECHNICAL REQUIREMENTS:
 TRD: {trd_context}
 
-OUTPUT JSON list with EXACTLY these fields per story:
-- id: unique identifier
-- name: story name
-- description: user-facing description
-- llm_prompt: **EXPLICIT prompt for code generator** (e.g., "Create a login form using React that calls /api/login endpoint and stores JWT in localStorage")
-- success_criteria: testable acceptance criteria (list)
-- tech_suggestions: dict of tech hints extracted from TRD's Tech Stack Summary (e.g., {{"backend_tech": "FastAPI", "database": "PostgreSQL", "auth": "JWT"}})
-- depends_on: list of story IDs this depends on (empty list if no dependencies)
-- sequence_order: integer for execution order (1, 2, 3, ...)
+OUTPUT MARKDOWN format with one story per section. Each story MUST follow this structure:
+
+## Story [ID]: [Story Name]
+**Sequence:** [integer]
+**Depends On:** [comma-separated IDs or "none"]
+**Tech:** [key=value pairs extracted from TRD Tech Stack Summary]
+
+### LLM Prompt
+[EXPLICIT prompt for code generator - detailed enough for direct implementation without guessing]
+
+### Success Criteria
+- [Testable criterion 1]
+- [Testable criterion 2]
+- [Testable criterion 3]
+---
+
+EXAMPLE:
+## Story story_001: User Login
+**Sequence:** 1
+**Depends On:** none
+**Tech:** backend_tech=FastAPI, database=PostgreSQL, auth=JWT
+
+### LLM Prompt
+Create a login form component using React that sends POST request to /api/login endpoint with email/password, validates response, stores JWT token in localStorage, and redirects to dashboard on success.
+
+### Success Criteria
+- Login form accepts email and password input
+- Form validation prevents empty submissions
+- Successful login stores JWT and redirects to /dashboard
+- Failed login displays error message
+---
 
 CRITICAL RULES:
 - The llm_prompt MUST be specific enough that a code generator can implement it without guessing.
 - The tech_suggestions MUST be extracted from the TRD's "Tech Stack Summary" section, not heuristics.
 - Each story's sequence_order determines build order: lower numbers build first.
-- Use depends_on to indicate story dependencies (e.g., story_2 might depend_on ["story_1"]).
-- For static/frontend-only products (no backend in TRD), only generate frontend stories."""
+- Use depends_on to indicate story dependencies (e.g., story_2 might depend_on story_1).
+- For static/frontend-only products (no backend in TRD), only generate frontend stories.
+- Separate each story with a markdown horizontal rule (---)."""
 
     STORIES_CRITIC_SYS = """You are a strict Agile QA Auditor.
 
