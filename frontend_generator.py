@@ -4,11 +4,15 @@ Generates vanilla JavaScript frontend code from FrontendSpec specifications.
 """
 
 import json
+import time
+import logging
 from typing import Dict, Optional
 import instructor
 import litellm
 from pydantic import BaseModel, Field
 from story_translator import FrontendSpec, UIPage, UIComponent
+
+logger = logging.getLogger(__name__)
 
 
 class GeneratedFrontendCode(BaseModel):
@@ -25,7 +29,8 @@ class FrontendGeneratorConfig(BaseModel):
         default="meta-llama/llama-3.3-70b-instruct:free",
         description="LLM model to use"
     )
-    api_key: Optional[str] = Field(default=None, description="API key for LLM")
+    api_key: Optional[str] = Field(default=None, description="API key for LLM provider")
+    api_base: Optional[str] = Field(default=None, description="Custom API base URL for OpenAI-compatible providers")
 
 
 class FrontendGenerator:
@@ -74,7 +79,7 @@ CODE QUALITY:
 STORY: {story_name}
 DESCRIPTION: {story_description}
 
-PRODUCT CONTEXT (use this to match the output type and complexity to the actual product):
+PRODUCT CONTEXT (read the PRD to understand what the user actually requested):
 PRD Summary: {prd_context}
 
 FRONTEND SPECIFICATION:
@@ -88,6 +93,7 @@ Generate the following:
    - ARIA labels for accessibility
    - Responsive containers
    - Loading states (spinner divs)
+   - Page content should match the FrontendSpec and PRD requirements EXACTLY — no invented features
 
 2. JavaScript Components
    - Page initialization functions
@@ -114,6 +120,42 @@ Follow this pattern:
 
 Return valid JSON with keys: pages, components, styles, navigation_update"""
 
+    STATIC_SYSTEM_PROMPT = """You are a Senior Frontend Developer specializing in beautiful, print-ready HTML advertisements and promotional materials.
+
+Your task is to generate a SINGLE, COMPLETELY SELF-CONTAINED HTML file. All CSS must be inline in a <style> block. No external stylesheets. No JavaScript frameworks. No navigation bars. No login buttons. No SPA routing.
+
+RULES — NEVER VIOLATE THESE:
+- ONE file only. Everything (HTML structure, all CSS) lives inside a single .html file.
+- NO <link rel="stylesheet"> tags pointing to external files.
+- NO <script src="..."> tags.
+- NO navigation bar, header nav, login/logout links, or page routing.
+- NO references to /api.js, /nav.js, fetchAPI, registerPage, or any SPA infrastructure.
+- The output should be printable and visually complete with zero dependencies.
+- Design should match the product type: advertisement = bold colors, clear call-to-action, contact info.
+- Use emoji, icons, and compelling copy appropriate to the business.
+
+OUTPUT: Return valid JSON with keys:
+  pages: {{ "index.html": "<full self-contained HTML string>" }}
+  components: {{}}
+  styles: {{}}
+  navigation_update: ""
+"""
+
+    STATIC_USER_PROMPT_TEMPLATE = """Create a beautiful, self-contained HTML advertisement for:
+
+PRODUCT: {story_name}
+DESCRIPTION: {story_description}
+
+Requirements:
+- Single HTML file with ALL CSS inlined in a <style> tag
+- Visually striking design appropriate for: {story_description}
+- Include: headline, key services/features (3-5 items), a compelling tagline, and contact/CTA section
+- Use attractive colors, spacing, and typography (web-safe fonts or Google Fonts via @import)
+- Suitable for printing (A4) or viewing in a browser
+- NO navigation bar, NO login links, NO API calls, NO JavaScript unless purely decorative
+
+Return JSON: {{ "pages": {{ "index.html": "<complete html>" }}, "components": {{}}, "styles": {{}}, "navigation_update": "" }}"""
+
     def __init__(self, config: Optional[FrontendGeneratorConfig] = None):
         """Initialize the frontend generator."""
         self.config = config or FrontendGeneratorConfig()
@@ -123,48 +165,89 @@ Return valid JSON with keys: pages, components, styles, navigation_update"""
     def generate_code(
         self,
         frontend_spec: FrontendSpec,
-        context_docs: Optional[Dict[str, str]] = None
+        context_docs: Optional[Dict[str, str]] = None,
+        max_retries: int = 3,
+        timeout_seconds: int = 60
     ) -> GeneratedFrontendCode:
         """
-        Generate frontend code from a FrontendSpec.
-        Tries LLM first, falls back to deterministic generators if LLM fails.
+        Generate frontend code from a FrontendSpec with rate-limit aware retry logic.
+        Tries LLM first with exponential backoff, falls back to deterministic generators if LLM fails.
 
         Args:
             frontend_spec: The frontend specification to generate code from
             context_docs: Optional PRD/TRD context for product-aware generation
+            max_retries: Maximum number of retry attempts (default 3)
+            timeout_seconds: Timeout for each LLM call in seconds (default 60)
 
         Returns:
             GeneratedFrontendCode with all HTML, JS, and CSS files
         """
         context_docs = context_docs or {}
-        try:
-            # Try LLM-based generation first
-            spec_json = json.dumps(frontend_spec.to_dict(), indent=2)
-            prd_context = (context_docs.get("PRD", context_docs.get("prd", "")) or "Not available")[:800]
-            user_prompt = self.USER_PROMPT_TEMPLATE.format(
-                story_name=frontend_spec.story_name,
-                story_description=frontend_spec.description,
-                prd_context=prd_context,
-                frontend_spec=spec_json,
-            )
 
-            response = self.client.create(
-                model=self.config.llm_model,
-                messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_model=GeneratedFrontendCode,
-                api_key=self.api_key,
-                max_retries=1,
-            )
-            return response
-        except Exception as e:
-            # Fallback to deterministic code generation
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(f"⚠ LLM generation failed ({type(e).__name__}: {str(e)[:100]}), using fallback generators")
-            print(f"⚠ LLM generation failed ({type(e).__name__}), using fallback generators")
+        # Static products (ads, flyers, promo pages) get a single self-contained HTML file
+        if getattr(frontend_spec, 'is_frontend_only', False):
+            return self._generate_static_html(frontend_spec)
+
+        # Try LLM-based generation with exponential backoff for rate limits
+        for attempt in range(max_retries):
+            try:
+                # Try LLM-based generation first
+                spec_json = json.dumps(frontend_spec.to_dict(), indent=2)
+                # Use shorter truncation (500 chars) to avoid timeouts on large docs
+                prd_context = (context_docs.get("PRD", context_docs.get("prd", "")) or "Not available")[:500]
+                user_prompt = self.USER_PROMPT_TEMPLATE.format(
+                    story_name=frontend_spec.story_name,
+                    story_description=frontend_spec.description,
+                    prd_context=prd_context,
+                    frontend_spec=spec_json,
+                )
+
+                completion_kwargs = {
+                    "model": self.config.llm_model,
+                    "messages": [
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "response_model": GeneratedFrontendCode,
+                    "api_key": self.api_key,
+                    "timeout": timeout_seconds,
+                    "max_retries": 0,  # Handle retries manually with exponential backoff
+                }
+                if self.config.api_base:
+                    completion_kwargs["api_base"] = self.config.api_base
+
+                logger.info(f"Frontend generation attempt {attempt + 1}/{max_retries}")
+                response = self.client.create(**completion_kwargs)
+                return response
+
+            except Exception as e:
+                error_str = str(e)
+                is_rate_limit = "429" in error_str or "rate" in error_str.lower() or "quota" in error_str.lower()
+                is_timeout = "timeout" in error_str.lower() or "deadline" in error_str.lower()
+
+                if attempt < max_retries - 1:
+                    # Backoff strategy based on error type:
+                    # - Rate limit (429): need >= 60s to let the RPM window reset
+                    #   Wait 20s → 60s across retries
+                    # - Timeout/stall: API was unresponsive; short wait then retry
+                    #   Wait 5s → 15s across retries
+                    # - Other errors: moderate wait
+                    #   Wait 10s → 30s across retries
+                    if is_rate_limit:
+                        wait_time = [20, 60][min(attempt, 1)]
+                    elif is_timeout:
+                        wait_time = [5, 15][min(attempt, 1)]
+                    else:
+                        wait_time = [10, 30][min(attempt, 1)]
+
+                    logger.warning(f"⚠ Frontend LLM attempt {attempt + 1} failed ({type(e).__name__}). "
+                                 f"Rate limit: {is_rate_limit}, Timeout: {is_timeout}. "
+                                 f"Retrying in {wait_time}s...")
+                    print(f"⚠ Frontend generation attempt {attempt + 1} failed ({type(e).__name__}). Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.warning(f"⚠ LLM generation failed after {max_retries} attempts ({type(e).__name__}: {str(e)[:100]}), using fallback generators")
+                    print(f"⚠ LLM generation failed after {max_retries} attempts, using fallback generators")
 
             # Generate pages
             pages = {}
@@ -194,6 +277,69 @@ Return valid JSON with keys: pages, components, styles, navigation_update"""
                 navigation_update=navigation_code,
             )
 
+    def _generate_static_html(self, frontend_spec: FrontendSpec) -> 'GeneratedFrontendCode':
+        """
+        Generate a single self-contained HTML file for static products (ads, flyers, etc.).
+        Uses the static-specific LLM prompt; falls back to a minimal inline template.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        try:
+            user_prompt = self.STATIC_USER_PROMPT_TEMPLATE.format(
+                story_name=frontend_spec.story_name,
+                story_description=frontend_spec.description,
+            )
+            completion_kwargs = {
+                "model": self.config.llm_model,
+                "messages": [
+                    {"role": "system", "content": self.STATIC_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "response_model": GeneratedFrontendCode,
+                "api_key": self.api_key,
+                "max_retries": 1,
+            }
+            if self.config.api_base:
+                completion_kwargs["api_base"] = self.config.api_base
+
+            response = self.client.create(**completion_kwargs)
+            # Ensure nav-SPA artefacts are stripped out of the LLM response
+            response.components = {}
+            response.styles = {}
+            response.navigation_update = ""
+            return response
+        except Exception as e:
+            logger.warning(f"⚠ Static LLM generation failed ({type(e).__name__}: {str(e)[:100]}), using fallback")
+            description = frontend_spec.description
+            title = frontend_spec.story_name
+            html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 0; padding: 40px; background: #f9f9f9; color: #333; }}
+        .container {{ max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
+        h1 {{ color: #2c3e50; margin-top: 0; }}
+        p {{ line-height: 1.7; font-size: 16px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>{title}</h1>
+        <p>{description}</p>
+    </div>
+</body>
+</html>"""
+            return GeneratedFrontendCode(
+                pages={"index.html": html},
+                components={},
+                styles={},
+                navigation_update="",
+            )
+
     def generate_page_template(self, page: UIPage) -> str:
         """
         Generate HTML template for a page.
@@ -217,7 +363,7 @@ Return valid JSON with keys: pages, components, styles, navigation_update"""
             <h1>{page.title}</h1>
             <p class="page-description">{page.description}</p>
 
-            <!-- Page content will be rendered here -->
+            <!-- Page content -->
             <div id="page-content" class="content"></div>
 
             <!-- Loading state -->
@@ -490,6 +636,217 @@ window.addEventListener('beforeunload', () => {{
 
         return registration_code
 
+    def _generate_landing_page(self, frontend_spec: FrontendSpec, prd_context: str = "") -> str:
+        """Generate a proper landing page (index.html) for multi-page applications using PRD context.
+
+        CRITICAL: When PRD context is available, extract title and description from PRD only.
+        Never use story_name or story description — these contain technical/TRD content.
+        """
+        # Extract title and description from PRD if available (NOT from story)
+        title = frontend_spec.story_name  # fallback
+        description = frontend_spec.description  # fallback
+
+        if prd_context:
+            lines = prd_context.split('\n')
+
+            # Extract product name from **Project:** line
+            for line in lines:
+                if '**Project:**' in line:
+                    # Extract text after "**Project:** " marker
+                    project_text = line.split('**Project:**')[1].strip()
+                    if project_text:
+                        title = project_text
+                        break
+
+            # Extract business purpose from "Vision & Success Statement" or "Purpose & Scope" section
+            purpose_lines = []
+            in_purpose_section = False
+            for i, line in enumerate(lines):
+                # Look for Vision, Purpose, or Scope section headers
+                if any(header in line for header in [
+                    '### 1. Vision',
+                    '## 1. Vision',
+                    '### Vision & Success',
+                    '## Vision & Success',
+                    '### 1. Purpose & Scope',
+                    '## 1. Purpose & Scope'
+                ]):
+                    in_purpose_section = True
+                    continue
+
+                if in_purpose_section:
+                    # Stop when we hit the next section
+                    if (line.startswith('###') or line.startswith('##')) and line.strip():
+                        break
+
+                    # Collect non-empty, non-separator lines
+                    if line.strip() and not line.startswith('---') and not line.startswith('|'):
+                        # Skip technical/implementation keywords
+                        if not any(tech in line for tech in [
+                            'Technical', 'TRD', 'Database', 'API', 'FastAPI', 'Backend',
+                            'CI/CD', 'GitHub', 'Workflow', 'WSGI', 'Flask', 'Apache',
+                            'Nginx', 'environment', 'caching', 'deployment', 'hosted',
+                            'server', 'infrastructure'
+                        ]):
+                            purpose_lines.append(line.strip())
+
+            # Use extracted purpose or fallback to frontend_spec description
+            if purpose_lines:
+                description = ' '.join(purpose_lines)[:300].strip()
+
+        # Extract page links from frontend spec
+        page_links = ""
+        if frontend_spec.pages:
+            for page in frontend_spec.pages:
+                page_links += f'<li><a href="pages/{page.name}.html">{page.title}</a></li>\n                '
+
+        # Use PRD context to create product-specific content snippet
+        prd_snippet = ""
+        if prd_context:
+            # Extract business-focused content from PRD (skip headers and technical sections)
+            lines = prd_context.split('\n')
+            business_lines = []
+
+            for line in lines:
+                # Skip headers, technical markers, and empty lines
+                if (line.strip() and
+                    not line.startswith('#') and
+                    not line.startswith('|') and
+                    not line.startswith('**') and
+                    'Technical' not in line and
+                    'TRD' not in line and
+                    'Database' not in line and
+                    'API' not in line and
+                    'FastAPI' not in line and
+                    'Backend' not in line and
+                    'CI/CD' not in line and
+                    'GitHub' not in line and
+                    'Workflow' not in line):
+                    business_lines.append(line.strip())
+
+            # Extract key business statements (usually vision, goals, or features)
+            features_text = '\n'.join(business_lines[:10])[:300]
+            if features_text:
+                prd_snippet = f"<p>{features_text}</p>"
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title} - Home</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #f5f5f5;
+        }}
+        nav {{
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            padding: 1rem 2rem;
+            background: #fff;
+            border-bottom: 1px solid #ddd;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        nav a {{
+            text-decoration: none;
+            color: #333;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }}
+        nav a:hover {{
+            background: #e0e0e0;
+        }}
+        nav a:first-child {{
+            font-weight: bold;
+            font-size: 1.1rem;
+        }}
+        nav > div {{
+            margin-left: auto;
+        }}
+        main {{
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 0 2rem;
+        }}
+        section {{
+            background: white;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            color: #2c3e50;
+            margin-top: 0;
+        }}
+        h2 {{
+            color: #34495e;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 0.5rem;
+        }}
+        ul {{
+            line-height: 1.8;
+        }}
+        a {{
+            color: #3498db;
+            text-decoration: none;
+        }}
+        a:hover {{
+            text-decoration: underline;
+        }}
+        code {{
+            background: #f5f5f5;
+            padding: 0.2rem 0.4rem;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }}
+        footer {{
+            text-align: center;
+            padding: 2rem;
+            color: #999;
+            border-top: 1px solid #ddd;
+            margin-top: 4rem;
+        }}
+    </style>
+</head>
+<body>
+    <nav>
+        <a href="index.html">{title}</a>
+        <div>
+            <a href="pages/login.html" style="display: none;">Admin Login</a>
+        </div>
+    </nav>
+
+    <main>
+        <section>
+            <h1>Welcome to {title}</h1>
+            <p>Explore the features and pages below to get started.</p>
+        </section>
+
+        <section>
+            <h2>Pages</h2>
+            <ul>
+                {page_links}
+            </ul>
+        </section>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 {title}. All rights reserved.</p>
+    </footer>
+
+    <script src="js/nav.js"></script>
+</body>
+</html>"""
+        return html
+
     def integrate_with_product(
         self,
         frontend_spec: FrontendSpec,
@@ -512,19 +869,27 @@ window.addEventListener('beforeunload', () => {{
         # Generate code
         code = self.generate_code(frontend_spec, context_docs)
 
-        # Pages
+        # Static products: single index.html at the frontend root, nothing else
+        if getattr(frontend_spec, 'is_frontend_only', False):
+            html_content = code.pages.get("index.html", next(iter(code.pages.values()), ""))
+            generated_files["index.html"] = html_content
+            return generated_files
+
+        # Dynamic multi-page products: pages in pages/ directory + proper index.html at root
+        # Generate landing page (index.html) with PRD context
+        prd_context = context_docs.get("PRD", "") if context_docs else ""
+        generated_files["index.html"] = self._generate_landing_page(frontend_spec, prd_context)
+
+        # Generate individual pages
         for filename, content in code.pages.items():
             generated_files[f"pages/{filename}"] = content
 
-        # Components
         for filename, content in code.components.items():
             generated_files[f"components/{filename}"] = content
 
-        # Styles
         for filename, content in code.styles.items():
             generated_files[f"styles/{filename}"] = content
 
-        # Navigation
         generated_files["js/nav-registration.js"] = code.navigation_update
 
         return generated_files

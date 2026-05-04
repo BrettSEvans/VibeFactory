@@ -8,6 +8,36 @@ from typing import ClassVar, Dict, List, Optional
 from pydantic import BaseModel, Field, ConfigDict
 
 
+class Story(BaseModel):
+    """
+    Represents a user story with embedded LLM prompt for code generators.
+    Each story is self-contained with all information needed to generate code.
+    """
+    id: str = Field(..., description="Unique story identifier")
+    name: str = Field(..., description="Story name/title")
+    description: str = Field(..., description="Story description and context")
+    llm_prompt: str = Field(..., description="Explicit LLM prompt for code generator (what to build)")
+    success_criteria: List[str] = Field(default_factory=list, description="How to validate the story")
+    tech_suggestions: Dict[str, str] = Field(default_factory=dict, description="Tech stack hints from TRD (e.g., backend_tech, frontend_tech, database)")
+    depends_on: List[str] = Field(default_factory=list, description="IDs of stories this depends on")
+    sequence_order: int = Field(default=0, description="Execution order for sequential building")
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": "story_001",
+                "name": "User Authentication",
+                "description": "Allow users to sign up and log in",
+                "llm_prompt": "Create a user authentication system with login/signup forms using FastAPI backend and React frontend. Use JWT tokens for session management.",
+                "success_criteria": ["Login form works", "User data persisted", "JWT tokens valid"],
+                "tech_suggestions": {"backend_tech": "FastAPI", "frontend_tech": "React", "database": "PostgreSQL"},
+                "depends_on": [],
+                "sequence_order": 1
+            }
+        }
+    )
+
+
 class CritiqueEntry(BaseModel):
     """Represents a critique or feedback entry from an agent."""
     agent_name: str = Field(..., description="Name of the agent providing feedback")
@@ -65,7 +95,7 @@ class ProjectState(BaseModel):
     rough_idea: str = Field(..., description="Initial project idea or description")
     current_phase: str = Field(default="IDEA", description="Current development phase")
     docs: Dict[str, Document] = Field(default_factory=dict, description="Project documents keyed by type")
-    stories: List[Dict] = Field(default_factory=list, description="User stories and dependency graphs")
+    stories: List[Story] = Field(default_factory=list, description="User stories with embedded code generation prompts")
     codebase: Dict[str, str] = Field(default_factory=dict, description="File paths and their contents")
     history: List[Dict] = Field(default_factory=list, description="Event log for audit trail")
 

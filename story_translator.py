@@ -4,9 +4,10 @@ Converts user stories from the STORIES phase into backend and frontend specifica
 """
 
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from enum import Enum
+from state import Story
 
 
 class HTTPMethod(Enum):
@@ -119,6 +120,7 @@ class FrontendSpec:
     story_id: str
     story_name: str
     description: str
+    is_frontend_only: bool = False  # True if TRD specifies no backend (single self-contained HTML)
     pages: List[UIPage] = field(default_factory=list)
     components: List[UIComponent] = field(default_factory=list)  # Reusable components
     api_endpoints: List[str] = field(default_factory=list)  # Backend endpoints used
@@ -188,30 +190,45 @@ class StoryTranslator:
 
     def translate_story(
         self,
-        story: Dict,
+        story: Union[Story, Dict],
         context_docs: Optional[Dict[str, str]] = None
     ) -> Tuple[BackendSpec, FrontendSpec]:
         """
         Translate a single story into backend and frontend specifications.
 
         Args:
-            story: Story dictionary with id, name, description, depends_on, success_criteria
+            story: Story object (from state.Story) or legacy dict with id, name, description, depends_on, success_criteria
             context_docs: Optional context documents (PRD, TRD) for additional context
 
         Returns:
             Tuple of (BackendSpec, FrontendSpec)
         """
-        story_id = story.get("id", "unknown")
-        story_name = story.get("name", "")
-        description = story.get("description", "")
-        success_criteria = story.get("success_criteria", [])
+        # Handle both Story objects and legacy dicts
+        if isinstance(story, Story):
+            story_id = story.id
+            story_name = story.name
+            # IMPORTANT: llm_prompt contains technical implementation instructions.
+            # It is passed to backend spec only — NEVER to frontend spec.
+            # Frontend spec uses only story.description (which should be business-level).
+            llm_prompt = getattr(story, "llm_prompt", None) or ""
+            # Full description with llm_prompt for backend spec (technical)
+            backend_description = f"{llm_prompt}\n{story.description}" if llm_prompt else story.description
+            # Clean description without llm_prompt for frontend spec (user-facing)
+            frontend_description = story.description
+            success_criteria = story.success_criteria
+        else:
+            story_id = story.get("id", "unknown")
+            story_name = story.get("name", "")
+            backend_description = story.get("description", "")
+            frontend_description = story.get("description", "")
+            success_criteria = story.get("success_criteria", [])
 
-        # Extract backend and frontend requirements from description and criteria
+        # Extract backend and frontend requirements from separate descriptions
         backend_spec = self._extract_backend_spec(
-            story_id, story_name, description, success_criteria, context_docs
+            story_id, story_name, backend_description, success_criteria, context_docs
         )
         frontend_spec = self._extract_frontend_spec(
-            story_id, story_name, description, success_criteria, context_docs
+            story_id, story_name, frontend_description, success_criteria, context_docs
         )
 
         return backend_spec, frontend_spec
@@ -224,46 +241,53 @@ class StoryTranslator:
     ) -> bool:
         """
         Determine if the product needs a backend server.
-        Returns False for static/HTML-only products.
+
+        TRD is the authority: if TRD specifies backend tech stack (APIs, database, etc),
+        then backend is needed. If TRD is silent or specifies frontend-only, backend not needed.
+
+        Falls back to context_docs (PRD) for signals if TRD unavailable.
         """
-        static_keywords = [
-            "static", "html", "flyer", "promotional", "landing page",
-            "one page", "one-page", "brochure", "informational",
-            "display only", "no backend", "frontend only", "pure html",
-            "single page html", "webpage", "presentation", "poster",
-            "advertisement", "promo page", "marketing page",
-        ]
-
-        # Check PRD content for static product signals
-        prd_content = context_docs.get("PRD", context_docs.get("prd", "")).lower()
-        if prd_content and any(kw in prd_content for kw in static_keywords):
-            return False
-
-        # Check story description
-        desc_lower = description.lower()
-        if any(kw in desc_lower for kw in static_keywords):
-            return False
-
-        # Explicit backend signals in success criteria
-        criteria_text = " ".join(success_criteria).lower() if isinstance(success_criteria, list) else str(success_criteria).lower()
-        backend_signals = ["api", "database", "crud", "endpoint", "server",
-                           "authenticate", "login", "register", "store data",
-                           "save", "retrieve", "persist"]
-        if any(kw in criteria_text for kw in backend_signals):
-            return True
-
-        # Check TRD for architecture decisions
+        # PRIMARY: Check TRD for explicit backend architecture
         trd_content = context_docs.get("TRD", context_docs.get("trd", "")).lower()
         if trd_content:
-            if any(kw in trd_content for kw in ["fastapi", "sqlalchemy", "api endpoint", "database schema"]):
+            # Backend indicators in TRD (architecture decisions)
+            backend_indicators = [
+                "fastapi", "flask", "django", "nodejs", "express",
+                "database", "postgresql", "mysql", "mongodb",
+                "api endpoint", "rest api", "graphql",
+                "authentication", "jwt", "oauth",
+                "backend", "server", "microservice"
+            ]
+
+            # Frontend-only indicators in TRD
+            frontend_only_indicators = [
+                "static html", "frontend only", "no backend",
+                "client-side only", "spa without api"
+            ]
+
+            # TRD says backend is needed
+            if any(ind in trd_content for ind in backend_indicators):
                 return True
-            if any(kw in trd_content for kw in static_keywords):
+
+            # TRD explicitly says no backend
+            if any(ind in trd_content for ind in frontend_only_indicators):
                 return False
 
-        # If PRD exists but has no backend signals, lean toward static
+            # TRD is present but ambiguous - return True (safer default for ambiguity)
+            return True
+
+        # FALLBACK: Check PRD if TRD unavailable
+        prd_content = context_docs.get("PRD", context_docs.get("prd", "")).lower()
         if prd_content:
-            backend_prd_signals = ["user authentication", "data storage", "api", "crud", "database", "user account"]
-            return any(kw in prd_content for kw in backend_prd_signals)
+            backend_signals = [
+                "user authentication", "data storage", "database", "api",
+                "crud", "user account", "login", "signup", "store",
+                "persistence", "server", "backend"
+            ]
+            return any(sig in prd_content for sig in backend_signals)
+
+        # FINAL FALLBACK: if no docs, assume backend needed (safer)
+        return True
 
         # Default: needs backend when uncertain
         return True
@@ -271,26 +295,48 @@ class StoryTranslator:
     def _extract_entities_from_context(self, context_docs: Dict[str, str]) -> List[str]:
         """
         Extract entity/model names from TRD or PRD context documents.
-        Parses for model definitions, table names, or resource classes.
+
+        For TRD: Parses for model definitions, table names, or resource classes.
+        For PRD: Extracts page names (Home Page, Services Page, Contact Page, etc.)
         """
         entities = []
-        trd_content = context_docs.get("TRD", context_docs.get("trd", ""))
-        if not trd_content:
-            return entities
-
         import re
-        # Look for: "User model", "Task table", "Product entity", class names, etc.
-        patterns = [
-            r'\b([A-Z][a-z]+)\s+(?:model|table|entity|resource|schema)\b',
-            r'(?:model|table|entity|resource|class)\s+([A-Z][a-z]+)\b',
-            r'##\s*([A-Z][a-z]+)\s*(?:Model|Table|Entity)',
-            r'`([A-Z][a-z]+)`\s+(?:model|table)',
-        ]
-        for pattern in patterns:
-            matches = re.findall(pattern, trd_content)
-            for m in matches:
-                if m not in entities and m not in {"The", "This", "Each", "When", "For"}:
-                    entities.append(m)
+
+        # First try TRD for backend entities (models, tables)
+        trd_content = context_docs.get("TRD", context_docs.get("trd", ""))
+        if trd_content:
+            # Look for: "User model", "Task table", "Product entity", class names, etc.
+            patterns = [
+                r'\b([A-Z][a-z]+)\s+(?:model|table|entity|resource|schema)\b',
+                r'(?:model|table|entity|resource|class)\s+([A-Z][a-z]+)\b',
+                r'##\s*([A-Z][a-z]+)\s*(?:Model|Table|Entity)',
+                r'`([A-Z][a-z]+)`\s+(?:model|table)',
+            ]
+            for pattern in patterns:
+                matches = re.findall(pattern, trd_content)
+                for m in matches:
+                    if m not in entities and m not in {"The", "This", "Each", "When", "For"}:
+                        entities.append(m)
+
+            return entities[:5]  # Cap at 5 entities; found TRD entities, return them
+
+        # Fallback: Try PRD for page names (Home Page, Services Page, Contact Page, etc.)
+        prd_content = context_docs.get("PRD", context_docs.get("prd", ""))
+        if prd_content:
+            # Look for page names: "Home Page", "Services Page", "Contact Page", "Booking Form", etc.
+            page_patterns = [
+                r'\*\*([A-Za-z\s]+)\s+(?:Page|Form)\*\*',  # **Home Page**, **Services Page**
+                r'(?:###|##)\s*(?:F[‑-]?\d+\s+)?([A-Za-z]+)',  # ### F‑01 Home or ## Home
+            ]
+            for pattern in page_patterns:
+                matches = re.findall(pattern, prd_content)
+                for m in matches:
+                    m = m.strip()
+                    # Filter out section headers and technical terms
+                    if (m and len(m) > 1 and
+                        m not in entities and
+                        m not in {"Core", "Features", "Business", "Goals", "Table", "Contents", "Out", "of"}):
+                        entities.append(m)
 
         return entities[:5]  # Cap at 5 entities to prevent explosion
 
@@ -373,25 +419,67 @@ class StoryTranslator:
         """
         Extract frontend specification from story.
 
+        IMPORTANT: PRD drives all UI content. TRD is never used for user-facing content.
+
         Strategy:
         1. For static/HTML-only products: return a single-page spec with no SPA complexity
-        2. For dynamic apps: use context docs (PRD/TRD) to determine pages and components,
+        2. For dynamic apps: use PRD content from context docs to determine pages and components,
            parsing story description as a fallback only
+
+        Data Flow:
+        - PRD (Product Requirements Document): Used for UI pages, descriptions, and user-facing text
+        - TRD (Technical Requirements Document): Used only for backend detection, never for UI content
         """
         context_docs = context_docs or {}
+        # Pull PRD content for UI generation – TRD is NEVER used for user-facing content
+        prd_content = context_docs.get("PRD", context_docs.get("prd", ""))
+
+        # CRITICAL: Use PRD for spec description AND product name — story names/descriptions are often technical.
+        spec_description = description  # fallback
+        spec_product_name = story_name  # fallback
+
+        if prd_content:
+            prd_lines = prd_content.split('\n')
+
+            # Extract product name from **Project:** line
+            for line in prd_lines:
+                if '**Project:**' in line:
+                    project_text = line.split('**Project:**')[1].strip()
+                    if project_text:
+                        spec_product_name = project_text
+                        break
+
+            # Extract short business description from Vision/Purpose section
+            for i, line in enumerate(prd_lines):
+                if any(h in line for h in ['### 1.', '## 1.', '### Vision', '## Vision', '### Purpose', '## Purpose']):
+                    vision_lines = []
+                    for vline in prd_lines[i+1:i+8]:
+                        if (vline.strip() and
+                            not vline.startswith('#') and
+                            not vline.startswith('---') and
+                            not vline.startswith('|') and
+                            not any(t in vline for t in ['Technical', 'TRD', 'Database', 'API', 'Flask', 'FastAPI', 'Backend', 'WSGI'])):
+                            vision_lines.append(vline.strip())
+                    if vision_lines:
+                        spec_description = ' '.join(vision_lines)[:250]
+                        break
+
         spec = FrontendSpec(
             story_id=story_id,
-            story_name=story_name,
-            description=description,
+            story_name=spec_product_name,  # PRD product name, not technical story name
+            description=spec_description,  # PRD-derived, not technical story description
         )
 
-        # Static product: minimal single-page frontend, no SPA routing or auth
+        # Frontend-only product: TRD specifies no backend needed
+        # Single self-contained HTML file, no SPA routing/auth/nav
         if not self._needs_backend(description, success_criteria, context_docs):
+            spec.is_frontend_only = True
             page = UIPage(
                 name="index",
                 route="/index.html",
-                title=story_name,
-                description=description,
+                title=spec_product_name,
+                # Always use PRD content for user‑facing description
+                description=prd_content if prd_content else spec_description,
                 requires_auth=False,
             )
             spec.pages.append(page)
@@ -406,10 +494,10 @@ class StoryTranslator:
         # Parse success criteria for user-facing operations
         ui_operations = self._parse_ui_operations(success_criteria)
 
-        # Generate pages for each entity and operation
+        # Generate pages for each entity and operation using PRD for page description
         for entity in entities:
             for op in ui_operations:
-                page = self._generate_ui_page(entity, op, description)
+                page = self._generate_ui_page(entity, op, prd_content if prd_content else description)
                 spec.pages.append(page)
 
         # Generate reusable components
@@ -593,7 +681,18 @@ class StoryTranslator:
         )
 
     def _generate_ui_page(self, entity: str, operation: str, description: str) -> UIPage:
-        """Generate a UI page specification."""
+        """
+        Generate a UI page specification.
+
+        Args:
+            entity: Resource name (e.g., "User", "Product")
+            operation: Operation type (list, create, read, update, delete, search)
+            description: PRD-derived description (from Product Requirements Document)
+                        This is used for user-facing page titles and descriptions only.
+
+        Returns:
+            UIPage specification with PRD-driven content (never includes TRD details)
+        """
         entity_lower = entity.lower()
         entity_plural = entity_lower + "s"
 

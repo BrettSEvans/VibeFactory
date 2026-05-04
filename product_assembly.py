@@ -17,13 +17,14 @@ class ProductAssemblyManager:
     Maintains shared codebase structure across story execution.
     """
 
-    def __init__(self, project_id: str, root_dir: str = "./products"):
+    def __init__(self, project_id: str, root_dir: str = "./products", context_docs: Optional[Dict[str, str]] = None):
         """
         Initialize the product assembly manager.
 
         Args:
             project_id: Unique project identifier
             root_dir: Root directory for products (default: ./products)
+            context_docs: Optional PRD/TRD context for README generation
         """
         self.project_id = project_id
         self.root_dir = Path(root_dir)
@@ -33,6 +34,7 @@ class ProductAssemblyManager:
         self.stories_implemented = {}
         self.api_endpoints = []
         self.frontend_pages = []
+        self.context_docs = context_docs or {}
 
     def initialize_product_structure(self) -> None:
         """Create the initial product directory structure."""
@@ -543,9 +545,60 @@ function initializeNav() {
             file_path: Relative path (e.g., 'pages/login.html')
             content: File content
         """
+        # Sanitize UI content to strip any technical TRD information
+        sanitized_content = self._sanitize_ui_content(content)
         full_path = self.frontend_dir / file_path
         full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(content)
+        full_path.write_text(sanitized_content)
+
+    def _sanitize_ui_content(self, content: str) -> str:
+        """
+        Remove technical TRD markers from UI content.
+
+        This ensures that frontend code only contains user-facing content from the PRD,
+        and no technical implementation details from the TRD.
+        """
+        tech_keywords = [
+            "Technical Specification", "Architecture", "Backend", "TRD",
+            "API", "Database", "SQL", "FastAPI", "JWT", "OAuth", "Auth",
+            "CORS", "Middleware", "Dependency", "Session"
+        ]
+        # Keep lines that do not contain any technical keyword
+        filtered_lines = [
+            line for line in content.splitlines()
+            if not any(keyword in line for keyword in tech_keywords)
+        ]
+        return "\n".join(filtered_lines)
+
+    def _sanitize_readme_content(self, content: str) -> str:
+        """
+        Ensure README only contains PRD-derived content, not TRD technical details.
+
+        README is user-facing and should focus on business goals, not technical implementation.
+        This removes any technical sections that might have inadvertently been included.
+        """
+        if not content:
+            return content
+
+        # Extract just the first paragraph (business description)
+        # Stop at first major section header or technical keyword
+        lines = content.split('\n')
+        safe_lines = []
+
+        tech_markers = ["TRD", "Technical", "API", "FastAPI", "Database", "Schema", "Endpoint", "Authentication"]
+
+        for line in lines:
+            # Stop if we hit a section header that looks technical
+            if line.startswith("###") or line.startswith("##"):
+                break
+            # Skip lines with technical content
+            if any(marker in line for marker in tech_markers):
+                continue
+            safe_lines.append(line)
+
+        # Return first non-empty result (usually first paragraph)
+        result = "\n".join(safe_lines).strip()
+        return result if result else "A product built with VibeFactory"
 
     def add_api_endpoint(self, story_id: str, endpoint_spec: Dict) -> None:
         """
@@ -591,11 +644,16 @@ function initializeNav() {
     def generate_mandatory_ui(self) -> None:
         """
         Update navigation with registered pages.
-        Only generates a dashboard overview if the product has multiple pages
-        (i.e., it is a multi-page application, not a single-page/static product).
+        Only runs for dynamic (SPA) products that have a nav.js scaffold.
+        Skipped entirely for static products (ads, flyers, single-file HTML).
         """
+        nav_js_path = self.frontend_dir / "js" / "nav.js"
+        if not nav_js_path.exists():
+            # Static product — no nav framework, nothing to update
+            return
+
         # Update nav.js with registered pages
-        nav_js = self._read_file(self.frontend_dir / "js" / "nav.js")
+        nav_js = self._read_file(nav_js_path)
 
         # Add page registrations
         page_registrations = ""
@@ -606,70 +664,6 @@ function initializeNav() {
             nav_js += f"\n// Auto-registered pages\n{page_registrations}"
             (self.frontend_dir / "js" / "nav.js").write_text(nav_js)
 
-        # Only generate a dashboard for multi-page applications (3+ registered pages)
-        if len(self.frontend_pages) >= 3:
-            dashboard_html = self._generate_dashboard()
-            (self.frontend_dir / "pages" / "dashboard.html").write_text(dashboard_html)
-
-    def _generate_dashboard(self) -> str:
-        """Generate dashboard HTML with all stories overview (multi-page apps only)."""
-        stories_html = ""
-        for story_id, info in self.stories_implemented.items():
-            story_name = info['data'].get('name', story_id)
-            stories_html += f'''
-        <div class="story-card">
-            <h3>{story_name}</h3>
-            <p>{info['data'].get('description', 'No description')}</p>
-        </div>
-'''
-
-        dashboard = f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Overview - {self.project_id}</title>
-    <link rel="stylesheet" href="../styles.css">
-    <style>
-        .stories-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 2rem;
-            margin-top: 2rem;
-        }}
-        .story-card {{
-            border: 1px solid #ddd;
-            padding: 1.5rem;
-            border-radius: 4px;
-            background: white;
-        }}
-        .story-card h3 {{
-            margin-bottom: 0.5rem;
-        }}
-    </style>
-</head>
-<body>
-    <nav id="navbar"></nav>
-    <main>
-        <h1>{self.project_id}</h1>
-        <p>Here's an overview of all implemented features.</p>
-
-        <div class="stories-grid">
-{stories_html}
-        </div>
-    </main>
-
-    <script src="../js/api.js"></script>
-    <script src="../js/nav.js"></script>
-    <script>
-        window.addEventListener('DOMContentLoaded', () => {{
-            initializeNav();
-        }});
-    </script>
-</body>
-</html>
-'''
-        return dashboard
 
     def export_product(self) -> str:
         """
@@ -680,8 +674,12 @@ function initializeNav() {
         """
         self.generate_mandatory_ui()
 
-        # Create docker-compose.yml
-        docker_compose = f'''version: '3.8'
+        # Determine if this is a static or dynamic product
+        has_backend = len(self.api_endpoints) > 0 or self.backend_dir.exists() and any(self.backend_dir.rglob('*.py'))
+
+        # Create docker-compose.yml (only for products with backend)
+        if has_backend:
+            docker_compose = f'''version: '3.8'
 
 services:
   api:
@@ -706,10 +704,11 @@ services:
 volumes:
   db:
 '''
-        (self.product_dir / "docker-compose.yml").write_text(docker_compose)
+            (self.product_dir / "docker-compose.yml").write_text(docker_compose)
 
         # Create start.sh
-        start_sh = f'''#!/bin/bash
+        if has_backend:
+            start_sh = f'''#!/bin/bash
 # Launch {self.project_id} product
 
 echo "🚀 Starting {self.project_id}..."
@@ -722,14 +721,67 @@ echo ""
 
 docker-compose up --build
 '''
+        else:
+            # Static product - just serve frontend
+            start_sh = f'''#!/bin/bash
+# Launch {self.project_id} product (static frontend)
+
+echo "🚀 Starting {self.project_id}..."
+echo ""
+echo "Frontend UI: http://localhost:8080"
+echo ""
+echo "Press Ctrl+C to stop"
+echo ""
+
+python -m http.server 8080 -d frontend
+'''
         start_sh_path = self.product_dir / "start.sh"
         start_sh_path.write_text(start_sh)
         os.chmod(start_sh_path, 0o755)
 
         # Create README
+        if has_backend:
+            project_type = "Full-Stack Application"
+            structure_section = """## Project Structure
+
+- `backend/` - FastAPI REST API
+- `frontend/` - Vanilla JavaScript web UI
+- `docker-compose.yml` - Local development environment
+"""
+            endpoints_section = f"""
+## API Endpoints
+
+{chr(10).join(f"- {ep['spec'].get('method', 'GET')} {ep['spec'].get('path', '')}" for ep in self.api_endpoints)}
+"""
+            customization_section = """
+## Customization
+
+Edit files in `backend/app/` and `frontend/` as needed. Changes auto-reload in development mode.
+"""
+        else:
+            project_type = "Static Frontend"
+            structure_section = """## Project Structure
+
+- `frontend/` - Vanilla HTML/CSS/JavaScript web UI (no backend required)
+"""
+            endpoints_section = ""
+            customization_section = """
+## Customization
+
+Edit files in `frontend/` as needed. No backend compilation required.
+"""
+
+                # Build a clean project description from PRD ONLY (never TRD)
+        # IMPORTANT: README is user-facing and must reflect business goals, not technical implementation
+        prd_content = self.context_docs.get("PRD", self.context_docs.get("prd", ""))
+        # Extract first paragraph from PRD for description
+        project_description = (prd_content[:500] if prd_content else f"Auto-generated {project_type} from VibeFactory")
+        # Sanitize to remove any technical markers that might have slipped through
+        project_description = self._sanitize_readme_content(project_description)
+
         readme = f'''# {self.project_id}
 
-Auto-generated product from VibeFactory
+{project_description}
 
 ## Quick Start
 
@@ -738,27 +790,12 @@ cd products/{self.project_id}
 bash start.sh
 ```
 
-Then open:
-- Frontend: http://localhost:8080
-- API Docs: http://localhost:8000/docs
+Then open http://localhost:8080
 
-## Project Structure
-
-- `backend/` - FastAPI REST API
-- `frontend/` - Vanilla JavaScript web UI
-- `docker-compose.yml` - Local development environment
-
+{structure_section}
 ## Implemented Stories
 
-{chr(10).join(f"- {s.get('name', sid)}: {s.get('description', '')}" for sid, s in [(k, v['data']) for k, v in self.stories_implemented.items()])}
-
-## API Endpoints
-
-{chr(10).join(f"- {ep['spec'].get('method', 'GET')} {ep['spec'].get('path', '')}" for ep in self.api_endpoints)}
-
-## Customization
-
-Edit files in `backend/app/` and `frontend/` as needed. Changes auto-reload in development mode.
+{chr(10).join(f"- {s.get('name', sid)}: {s.get('description', '')[:200].replace(chr(10),' ')}" for sid, s in [(k, v['data']) for k, v in self.stories_implemented.items()])}{endpoints_section}{customization_section}
 '''
         (self.product_dir / "README.md").write_text(readme)
 

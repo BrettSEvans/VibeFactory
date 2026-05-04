@@ -8,7 +8,7 @@ import json
 import os
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -31,9 +31,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from state import ProjectState, Document
+from state import ProjectState, Document, Story
 from orchestrator import BlindOrchestrator, OrchestratorConfig, Phase
 from product_generator import ProductGenerator, ProductGeneratorConfig
+from local_config import OLLAMA_HOST
 
 
 class GenerationRequest(BaseModel):
@@ -41,6 +42,8 @@ class GenerationRequest(BaseModel):
     project_id: Optional[str] = None  # User-provided project ID (optional, will generate if not provided)
     rough_idea: str
     skip_documents: bool = False  # Skip BRD/PRD/TRD if True
+    llm_provider: str = "openrouter"  # "ollama", "openrouter", or "inception"
+    llm_model: Optional[str] = None  # Specific model within provider
 
 
 class GenerationProgress(BaseModel):
@@ -52,12 +55,19 @@ class GenerationProgress(BaseModel):
     error: Optional[str] = None
 
 
+class ApprovalRequest(BaseModel):
+    """Request to approve a document phase and resume the pipeline."""
+    phase: str
+    content: str  # The (possibly edited) document text
+
+
 # Create FastAPI app
 app = FastAPI(title="VibeFactory UI", version="1.0")
 
 # Store generation status
 generation_status = {}
 progress_queues = {}  # {project_id: asyncio.Queue of progress updates}
+approval_futures: Dict[str, Dict[str, Any]] = {}  # {project_id: {phase: asyncio.Future}}
 
 
 # Define generation stages
@@ -122,6 +132,8 @@ async def serve_ui():
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>VibeFactory - Product Generator</title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.css">
+        <script src="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.js"></script>
         <style>
             * {
                 margin: 0;
@@ -238,6 +250,63 @@ async def serve_ui():
 
             .btn-secondary:hover {
                 background: #e0e0e0;
+            }
+
+            /* LLM Provider Selection Styles */
+            .btn-provider {
+                flex: 1;
+                padding: 12px;
+                border: 2px solid #e0e0e0;
+                background: white;
+                color: #333;
+                border-radius: 8px;
+                cursor: pointer;
+                font-weight: 400;
+                transition: all 0.3s;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                gap: 4px;
+            }
+
+            .btn-provider:hover:not(:disabled) {
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            }
+
+            .btn-provider.selected {
+                background: #4caf50;
+                color: white;
+                border-color: #4caf50;
+                font-weight: 600;
+                box-shadow: 0 4px 12px rgba(76, 175, 80, 0.3);
+            }
+
+            .btn-provider.selected:hover:not(:disabled) {
+                background: #43a047;
+                border-color: #43a047;
+            }
+
+            .btn-provider.unavailable {
+                background: #f5f5f5;
+                color: #999;
+                border-color: #ddd;
+                cursor: not-allowed;
+                opacity: 0.6;
+            }
+
+            .btn-provider.unavailable:hover {
+                transform: none;
+                box-shadow: none;
+            }
+
+            .btn-provider .provider-status {
+                font-size: 11px;
+                opacity: 0.8;
+            }
+
+            .btn-provider.selected .provider-status {
+                opacity: 0.9;
             }
 
             .status-section {
@@ -423,6 +492,49 @@ async def serve_ui():
                 background: #f9f9f9;
             }
 
+            /* HITL Review Panel */
+            .review-panel {
+                background: #fff;
+                border: 2px solid #667eea;
+                border-radius: 12px;
+                padding: 24px;
+                margin-top: 24px;
+            }
+            .review-header h2 {
+                margin: 0 0 6px 0;
+                font-size: 1.2rem;
+                color: #333;
+            }
+            .review-header p {
+                margin: 0 0 16px 0;
+                color: #666;
+                font-size: 0.9rem;
+            }
+            #editorContainer .EasyMDEContainer {
+                border-radius: 8px;
+                overflow: hidden;
+            }
+            #documentEditor {
+                width: 100%;
+                min-height: 300px;
+                padding: 12px;
+                font-family: monospace;
+                font-size: 0.85rem;
+                border: 1px solid #e0e0e0;
+                border-radius: 8px;
+                resize: vertical;
+                box-sizing: border-box;
+            }
+            .review-actions {
+                display: flex;
+                justify-content: flex-end;
+                margin-top: 16px;
+            }
+            .review-actions .btn-generate {
+                padding: 12px 28px;
+                font-size: 1rem;
+            }
+
             .checkbox-group {
                 display: flex;
                 align-items: center;
@@ -507,6 +619,22 @@ async def serve_ui():
                     >
                 </div>
 
+                <!-- LLM Provider Selection -->
+                <div class="form-group">
+                    <label>LLM Provider</label>
+                    <div id="providers-loading" class="status-message">
+                        🔍 Detecting available LLM providers...
+                    </div>
+                    <div id="providers-container" style="display: none;">
+                        <div id="provider-buttons" style="display: flex; gap: 12px; margin-bottom: 16px;"></div>
+                        <div id="model-selection" style="display: none; margin-top: 12px;">
+                            <label for="model-select" style="margin-bottom: 8px;">Model:</label>
+                            <select id="model-select" style="width: 100%; padding: 10px; border: 2px solid #e0e0e0; border-radius: 8px; font-family: inherit;">
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="form-group">
                     <label for="roughIdea">Your Idea</label>
                     <textarea
@@ -516,13 +644,6 @@ async def serve_ui():
                         required
                     ></textarea>
 
-                    <div class="examples">
-                        <h4>💡 Example ideas:</h4>
-                        <p onclick="fillExample('A simple task management system where users can create, update, and delete tasks.')">📋 Task management system</p>
-                        <p onclick="fillExample('A blog platform with post creation, commenting, and user authentication.')">📝 Blog platform</p>
-                        <p onclick="fillExample('An expense tracking app with categories, reports, and budget alerts.')">💰 Expense tracker</p>
-                        <p onclick="fillExample('A customer relationship management (CRM) system for tracking contacts and interactions.')">👥 CRM system</p>
-                    </div>
                 </div>
 
                 <div class="form-group checkbox-group">
@@ -530,10 +651,8 @@ async def serve_ui():
                         type="checkbox"
                         id="skipDocs"
                         name="skipDocs"
-                        checked
-                        disabled
                     >
-                    <label for="skipDocs" style="opacity: 0.6;">Skip document generation (BRD/PRD/TRD) and go directly to product <em>(enabled by default)</em></label>
+                    <label for="skipDocs">Skip document generation (BRD/PRD/TRD) — go straight to code</label>
                 </div>
 
                 <div class="button-group">
@@ -553,19 +672,23 @@ async def serve_ui():
                 <div class="stages-container">
                     <div class="stage" data-progress="5">
                         <div class="stage-dot">1</div>
-                        <div class="stage-label">Initializing</div>
+                        <div class="stage-label">BRD</div>
                     </div>
-                    <div class="stage" data-progress="40">
+                    <div class="stage" data-progress="20">
                         <div class="stage-dot">2</div>
-                        <div class="stage-label">Backend</div>
+                        <div class="stage-label">PRD</div>
                     </div>
-                    <div class="stage" data-progress="70">
+                    <div class="stage" data-progress="35">
                         <div class="stage-dot">3</div>
-                        <div class="stage-label">Frontend</div>
+                        <div class="stage-label">TRD</div>
                     </div>
-                    <div class="stage" data-progress="85">
+                    <div class="stage" data-progress="50">
                         <div class="stage-dot">4</div>
-                        <div class="stage-label">Assembly</div>
+                        <div class="stage-label">Stories</div>
+                    </div>
+                    <div class="stage" data-progress="75">
+                        <div class="stage-dot">5</div>
+                        <div class="stage-label">Code</div>
                     </div>
                     <div class="stage" data-progress="100">
                         <div class="stage-dot">✓</div>
@@ -590,6 +713,22 @@ async def serve_ui():
                     <a href="#" id="docsLink" target="_blank">📁 View Files</a>
                 </div>
             </div>
+
+            <!-- HITL Document Review Panel -->
+            <div class="review-panel" id="reviewPanel" style="display:none;">
+                <div class="review-header">
+                    <h2 id="reviewTitle">📄 Review Document</h2>
+                    <p id="reviewHint">Read the document below. Edit if needed, then click <strong>Approve &amp; Continue</strong> to proceed to the next phase.</p>
+                </div>
+                <div id="editorContainer">
+                    <textarea id="documentEditor"></textarea>
+                </div>
+                <div class="review-actions">
+                    <button id="approveBtn" class="btn-generate" onclick="approveDocument()">
+                        ✅ Approve &amp; Continue
+                    </button>
+                </div>
+            </div>
         </div>
 
         <script>
@@ -602,14 +741,182 @@ async def serve_ui():
             const progressFill = document.getElementById('progressFill');
             const resultPath = document.getElementById('resultPath');
 
-            function fillExample(text) {
-                document.getElementById('roughIdea').value = text;
+            // LLM Provider selection
+            let selectedProvider = localStorage.getItem('vibefactory_llm_provider') || 'openrouter';
+            let selectedModel = localStorage.getItem('vibefactory_llm_model') || null;
+
+            async function loadProviders() {
+                try {
+                    const response = await fetch('/api/llm-providers');
+                    const data = await response.json();
+
+                    document.getElementById('providers-loading').style.display = 'none';
+                    document.getElementById('providers-container').style.display = 'block';
+
+                    // Render provider buttons
+                    const container = document.getElementById('provider-buttons');
+                    container.innerHTML = '';
+
+                    for (const provider of data.providers) {
+                        const btn = document.createElement('button');
+                        btn.type = 'button';
+                        btn.className = 'btn-provider';
+                        
+                        // Add selected or unavailable class
+                        if (selectedProvider === provider.id) {
+                            btn.classList.add('selected');
+                        }
+                        if (!provider.available) {
+                            btn.classList.add('unavailable');
+                            btn.disabled = true;
+                        }
+                        
+                        btn.innerHTML = `${provider.name}<br><span class="provider-status">${provider.status}</span>`;
+
+                        if (provider.available) {
+                            btn.addEventListener('click', (e) => {
+                                e.preventDefault();
+                                selectProvider(provider);
+                            });
+                        }
+                        container.appendChild(btn);
+                    }
+
+                    // Initialize with default or stored provider
+                    const defaultProvider = data.providers.find(p => p.id === selectedProvider && p.available) ||
+                                             data.providers.find(p => p.available);
+                    if (defaultProvider) {
+                        selectProvider(defaultProvider);
+                    }
+                } catch (error) {
+                    document.getElementById('providers-loading').innerHTML = '❌ Failed to load providers';
+                    console.error('Error loading providers:', error);
+                }
             }
+
+            function selectProvider(provider) {
+                selectedProvider = provider.id;
+                selectedModel = null;
+                localStorage.setItem('vibefactory_llm_provider', provider.id);
+                localStorage.removeItem('vibefactory_llm_model');
+
+                // Update button styles - apply selected/unavailable classes
+                document.querySelectorAll('.btn-provider').forEach(btn => {
+                    const btnProviderName = btn.querySelector(':scope > span:first-child, :scope > div:first-child');
+                    const btnText = btnProviderName ? btnProviderName.textContent : btn.textContent;
+                    const isSelected = btnText.includes(provider.name);
+                    
+                    // Remove all state classes
+                    btn.classList.remove('selected', 'unavailable');
+                    
+                    if (isSelected) {
+                        btn.classList.add('selected');
+                    } else if (btn.disabled) {
+                        btn.classList.add('unavailable');
+                    }
+                });
+
+                // Update model dropdown
+                const modelSelect = document.getElementById('model-select');
+                const modelDiv = document.getElementById('model-selection');
+
+                if (provider.models && provider.models.length > 0) {
+                    modelSelect.innerHTML = '';
+                    for (const model of provider.models) {
+                        const option = document.createElement('option');
+                        option.value = model;
+                        option.textContent = model;
+                        modelSelect.appendChild(option);
+                    }
+                    modelDiv.style.display = 'block';
+
+                    // Auto-select stored model or first available
+                    const storedModel = localStorage.getItem('vibefactory_llm_model');
+                    const storedOption = storedModel && [...modelSelect.options].find(o => o.value === storedModel);
+                    if (storedOption) {
+                        modelSelect.value = storedModel;
+                        selectedModel = storedModel;
+                    } else {
+                        modelSelect.selectedIndex = 0;
+                        selectedModel = modelSelect.options[0].value;
+                        localStorage.setItem('vibefactory_llm_model', selectedModel);
+                    }
+
+                    modelSelect.addEventListener('change', (e) => {
+                        selectedModel = e.target.value;
+                        localStorage.setItem('vibefactory_llm_model', selectedModel);
+                    }, { once: true });
+                } else {
+                    modelDiv.style.display = 'none';
+                }
+            }
+
+            // ── HITL document review ────────────────────────────────────────────
+            let easyMDE = null;
+            let currentReviewPhase = null;
+            let currentProjectId = null;
+
+            function showReviewPanel(phase, docContent) {
+                currentReviewPhase = phase;
+                document.getElementById('reviewTitle').textContent = `📄 Review ${phase}`;
+                document.getElementById('reviewPanel').style.display = 'block';
+
+                // Destroy previous EasyMDE instance if any
+                if (easyMDE) { try { easyMDE.toTextArea(); } catch(e) {} easyMDE = null; }
+
+                const isJson = (phase === 'STORIES');
+                if (isJson) {
+                    // Plain textarea for JSON
+                    const ta = document.getElementById('documentEditor');
+                    ta.style.display = 'block';
+                    ta.value = docContent;
+                } else {
+                    // Hide raw textarea — EasyMDE renders its own
+                    document.getElementById('documentEditor').style.display = 'none';
+                    // Re-show it first (EasyMDE needs the element visible)
+                    document.getElementById('documentEditor').style.display = 'block';
+                    easyMDE = new EasyMDE({
+                        element: document.getElementById('documentEditor'),
+                        initialValue: docContent,
+                        spellChecker: false,
+                        autosave: { enabled: false },
+                        toolbar: ['bold','italic','heading','|','quote','unordered-list','ordered-list','|','preview','side-by-side','fullscreen'],
+                    });
+                }
+                document.getElementById('reviewPanel').scrollIntoView({ behavior: 'smooth' });
+            }
+
+            async function approveDocument() {
+                const content = easyMDE
+                    ? easyMDE.value()
+                    : document.getElementById('documentEditor').value;
+
+                const btn = document.getElementById('approveBtn');
+                btn.disabled = true;
+                btn.textContent = '⏳ Submitting...';
+
+                try {
+                    await fetch(`/api/approve/${currentProjectId}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ phase: currentReviewPhase, content })
+                    });
+                    document.getElementById('reviewPanel').style.display = 'none';
+                    addStatusMessage(`✅ ${currentReviewPhase} approved`, 'success');
+                } catch(err) {
+                    addStatusMessage(`❌ Failed to submit approval: ${err.message}`, 'error');
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = '✅ Approve & Continue';
+                }
+            }
+            // ────────────────────────────────────────────────────────────────────
 
             form.addEventListener('submit', async (e) => {
                 e.preventDefault();
 
                 const projectId = document.getElementById('projectId').value;
+                currentProjectId = projectId;  // needed by HITL approveDocument()
                 const roughIdea = document.getElementById('roughIdea').value;
                 const skipDocs = document.getElementById('skipDocs').checked;
 
@@ -636,6 +943,13 @@ async def serve_ui():
                         // Ignore heartbeat messages
                         if (data.heartbeat) return;
 
+                        // Handle HITL document review pause
+                        if (data.status === 'review_required') {
+                            addStatusMessage(`📄 ${data.phase} ready for review`, 'info');
+                            showReviewPanel(data.phase, data.document);
+                            return;  // don't update progress bar — wait for user approval
+                        }
+
                         // Update progress bar
                         progressFill.style.width = `${data.progress}%`;
 
@@ -650,10 +964,24 @@ async def serve_ui():
                             generationComplete = true;
                             eventSource.close();
                             addStatusMessage('✅ Product generated successfully!', 'success');
+                            generateBtn.disabled = false;
+
+                            // Show result section using product_path from SSE event
+                            if (data.product_path) {
+                                resultPath.textContent = data.product_path;
+                                const projectName = projectId.replace(/[^a-z0-9_-]/gi, '_');
+                                document.getElementById('localLink').href = `/product/${projectName}/frontend/index.html`;
+                                document.getElementById('docsLink').onclick = (e) => {
+                                    e.preventDefault();
+                                    fetch(`/api/open-folder/${projectName}`, {method: 'POST'}).catch(err => console.error(err));
+                                };
+                                resultSection.classList.add('active');
+                            }
                         } else if (data.status === 'failed') {
                             generationComplete = true;
                             eventSource.close();
                             addStatusMessage(`❌ Generation failed: ${data.message}`, 'error');
+                            generateBtn.disabled = false;
                         }
                     } catch (e) {
                         console.error('Error parsing progress:', e);
@@ -675,7 +1003,9 @@ async def serve_ui():
                         body: JSON.stringify({
                             project_id: projectId,
                             rough_idea: roughIdea,
-                            skip_documents: skipDocs
+                            skip_documents: skipDocs,
+                            llm_provider: selectedProvider,
+                            llm_model: selectedModel || null
                         })
                     });
 
@@ -685,24 +1015,19 @@ async def serve_ui():
 
                     const data = await response.json();
 
-                    // Show result
-                    resultPath.textContent = data.product_path;
-                    // Open the generated frontend index.html
-                    const indexPath = `${data.product_path}/frontend/index.html`;
-                    document.getElementById('localLink').href = `file://${indexPath}`;
-
-                    // Open the product directory for viewing code
-                    document.getElementById('docsLink').href = `file://${data.product_path}`;
-                    resultSection.classList.add('active');
+                    // Generation started in background — product_path and result section
+                    // are handled by the SSE onmessage 'completed' event handler above.
+                    if (data.status !== 'started') {
+                        throw new Error(`Unexpected response: ${JSON.stringify(data)}`);
+                    }
 
                 } catch (error) {
                     console.error('Error:', error);
+                    generateBtn.disabled = false;
+                    eventSource.close();
                     if (!generationComplete) {
                         addStatusMessage(`❌ ${error.message}`, 'error');
                     }
-                } finally {
-                    generateBtn.disabled = false;
-                    eventSource.close();
                 }
             });
 
@@ -741,19 +1066,23 @@ async def serve_ui():
                     }
                 }
             }
+
+            // Load providers when page loads
+            document.addEventListener('DOMContentLoaded', loadProviders);
         </script>
     </body>
     </html>
     """
 
 
-async def update_progress(project_id: str, step: str, progress: int, message: str, status: str = "in_progress"):
+async def update_progress(project_id: str, step: str, progress: int, message: str, status: str = "in_progress", extra: dict = None):
     """Update generation progress and broadcast to SSE clients."""
     update = {
         "step": step,
         "progress": progress,
         "message": message,
-        "status": status
+        "status": status,
+        **(extra or {})
     }
 
     # Update status dictionary
@@ -767,156 +1096,347 @@ async def update_progress(project_id: str, step: str, progress: int, message: st
             logger.error(f"Failed to broadcast progress: {e}")
 
 
-@app.post("/api/generate")
-async def generate_product(request: GenerationRequest):
-    """Generate a product from a rough idea."""
+async def wait_for_human_approval(
+    project_id: str, phase: str, doc_content: str, progress_pct: int
+) -> str:
+    """
+    Emit a review_required SSE event, then suspend until the user POSTs approval.
+    Returns the (possibly edited) document content.
+    """
+    if project_id not in approval_futures:
+        approval_futures[project_id] = {}
+    loop = asyncio.get_event_loop()
+    future: asyncio.Future = loop.create_future()
+    approval_futures[project_id][phase] = future
+
+    await update_progress(
+        project_id, f"{phase}_REVIEW", progress_pct,
+        f"📄 {phase} ready — review and approve to continue",
+        status="review_required",
+        extra={"phase": phase, "document": doc_content},
+    )
+
+    approved_content = await future  # suspends here until /api/approve is called
+    if project_id in approval_futures and phase in approval_futures[project_id]:
+        del approval_futures[project_id][phase]
+    return approved_content
+
+
+@app.post("/api/approve/{project_id}")
+async def approve_document(project_id: str, body: ApprovalRequest):
+    """Receive user approval (and possibly edited content) for a document phase."""
+    future = approval_futures.get(project_id, {}).get(body.phase)
+    if not future or future.done():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No pending review for phase '{body.phase}' in project '{project_id}'"
+        )
+    future.set_result(body.content)
+    return {"status": "approved", "phase": body.phase}
+
+
+@app.get("/api/llm-providers")
+async def get_llm_providers():
+    """Get available LLM providers and their status."""
+    providers = []
+
+    # Check Ollama availability
     try:
-        # Validate that rough idea is provided
-        if not request.rough_idea or not request.rough_idea.strip():
-            raise HTTPException(status_code=400, detail="Rough idea is required")
-        
-        # Generate project ID if not provided by user
-        if not request.project_id or not request.project_id.strip():
-            project_id = f"project_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            logger.info(f"No project ID provided, generated: {project_id}")
-        else:
-            project_id = request.project_id.strip().lower().replace(" ", "_").replace("-", "_")
-            logger.info(f"Starting product generation for project: {project_id}")
-        
-        rough_idea = request.rough_idea
-
-        # Initialize progress queue if it doesn't exist
-        if project_id not in progress_queues:
-            progress_queues[project_id] = asyncio.Queue()
-
-        # Update status
-        await update_progress(
-            project_id,
-            "Initializing",
-            5,
-            "Starting product generation...",
-            "in_progress"
-        )
-
-        # Step 1: Generate documents (BRD, PRD, TRD, STORIES)
-        # Note: Skipping document generation for now due to instructor library issue
-        # This will be fixed in the next update
-        if False and not request.skip_documents:
-            generation_status[project_id].update({
-                "step": "Document Generation",
-                "progress": 10,
-                "message": "Generating BRD, PRD, TRD, and Stories..."
+        import urllib.request
+        response = urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=5)
+        if response.status == 200:
+            data = json.loads(response.read().decode())
+            models = [m["name"] for m in data.get("models", [])]
+            providers.append({
+                "name": "Local Qwen (Ollama)",
+                "id": "ollama",
+                "available": True,
+                "models": models if models else ["qwen3.5:7b"],
+                "status": "✅ Ollama running"
             })
-
-            orchestrator_config = OrchestratorConfig(
-                llm_model="openrouter/meta-llama/llama-3.3-70b-instruct:free",  # OpenRouter Llama
-                max_retries=2,
-                pass_score=6
-            )
-            orchestrator = BlindOrchestrator(config=orchestrator_config)
-
-            # Create project state
-            project_state = ProjectState(
-                project_id=project_id,
-                rough_idea=rough_idea,
-                current_phase="IDEA"
-            )
-            orchestrator.set_state(project_state)
-
-            # Run orchestration phases
-            phases_to_run = [Phase.BRD, Phase.PRD, Phase.TRD, Phase.STORIES]
-            for i, phase in enumerate(phases_to_run):
-                progress = 10 + (i * 15)
-                generation_status[project_id].update({
-                    "progress": progress,
-                    "message": f"Generating {phase.value}..."
-                })
-
-                success, document = orchestrator.orchestrate_phase(phase)
-                if not success:
-                    raise Exception(f"{phase.value} generation failed")
-
-                project_state.set_document(phase.value, document)
-
-            # Get stories from project state
-            stories = project_state.stories
         else:
-            # Skip to product generation with sample story
-            stories = [{
-                "id": "story_001",
-                "name": "Core Feature",
-                "description": rough_idea,
-                "depends_on": [],
-                "success_criteria": ["Implementation complete"]
-            }]
+            raise Exception("Failed to connect to Ollama")
+    except Exception as e:
+        providers.append({
+            "name": "Local Qwen (Ollama)",
+            "id": "ollama",
+            "available": False,
+            "models": [],
+            "status": "⚠️ Ollama not running. Start with: ollama serve"
+        })
 
-        # Step 2: Generate product
-        await update_progress(
-            project_id,
-            "Generating Backend Code",
-            40,
-            "Generating backend code with FastAPI...",
-            "in_progress"
-        )
+    # Check OpenRouter API key
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    providers.append({
+        "name": "OpenRouter (Cloud)",
+        "id": "openrouter",
+        "available": bool(openrouter_api_key),
+        "models": ["meta-llama/llama-3.3-70b-instruct:free"],
+        "status": "✅ API key configured" if openrouter_api_key else "⚠️ OPENROUTER_API_KEY not set"
+    })
 
-        # Use OpenRouter model (Llama 3.3)
+    # Check Inception API key
+    inception_api_key = os.getenv("INCEPTION_API_KEY")
+    providers.append({
+        "name": "Inception Mercury-2",
+        "id": "inception",
+        "available": bool(inception_api_key),
+        "models": ["mercury-2"],
+        "status": "✅ API key configured" if inception_api_key else "⚠️ INCEPTION_API_KEY not set"
+    })
+
+    # Determine default based on availability (prefer local, then inception, then openrouter)
+    default = "ollama"
+    if not providers[0]["available"]:
+        default = "inception" if providers[2]["available"] else "openrouter"
+
+    return {"providers": providers, "default": default}
+
+
+async def _run_generation_task(
+    project_id: str,
+    rough_idea: str,
+    llm_model: str,
+    llm_api_key: Optional[str],
+    skip_documents: bool = False,
+    llm_api_base: Optional[str] = None,
+):
+    """
+    Background asyncio task: optionally runs BRD→PRD→TRD→Stories via BlindOrchestrator,
+    then generates product code via ProductGenerator.
+    Each orchestrator phase runs in a thread executor so the async event loop stays free
+    to flush SSE progress messages between phases.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        context_docs = {}
+        stories = None  # Will be populated from orchestrator or fall-through default
+
+        if not skip_documents:
+            # ── Document generation phase ──────────────────────────────────────
+            from state import ProjectState
+            from orchestrator import BlindOrchestrator, OrchestratorConfig, Phase
+
+            project_state = ProjectState(project_id=project_id, rough_idea=rough_idea)
+            orchestrator_config = OrchestratorConfig(
+                llm_model=llm_model,
+                api_key=llm_api_key,
+                api_base=llm_api_base,
+                max_retries=2,
+                pass_score=6,
+            )
+            orchestrator = BlindOrchestrator(config=orchestrator_config, state=project_state)
+
+            # BRD
+            await update_progress(project_id, "BRD", 5,
+                "📋 Writing Business Requirements Document...", "in_progress")
+            await asyncio.sleep(0)
+            await loop.run_in_executor(
+                None, lambda: orchestrator.orchestrate_phase(Phase.BRD)
+            )
+            # HITL: pause for BRD review
+            brd_doc = project_state.docs.get("BRD")
+            if brd_doc and brd_doc.content:
+                approved_brd = await wait_for_human_approval(project_id, "BRD", brd_doc.content, 12)
+                brd_doc.content = approved_brd
+                brd_doc.status = "approved"
+
+            # PRD
+            await update_progress(project_id, "PRD", 20,
+                "📝 Writing Product Requirements Document...", "in_progress")
+            await asyncio.sleep(0)
+            await loop.run_in_executor(
+                None, lambda: orchestrator.orchestrate_phase(Phase.PRD)
+            )
+            # HITL: pause for PRD review
+            prd_doc = project_state.docs.get("PRD")
+            if prd_doc and prd_doc.content:
+                approved_prd = await wait_for_human_approval(project_id, "PRD", prd_doc.content, 27)
+                prd_doc.content = approved_prd
+                prd_doc.status = "approved"
+
+            # TRD
+            await update_progress(project_id, "TRD", 35,
+                "🏗️ Writing Technical Requirements Document...", "in_progress")
+            await asyncio.sleep(0)
+            await loop.run_in_executor(
+                None, lambda: orchestrator.orchestrate_phase(Phase.TRD)
+            )
+            # HITL: pause for TRD review
+            trd_doc = project_state.docs.get("TRD")
+            if trd_doc and trd_doc.content:
+                approved_trd = await wait_for_human_approval(project_id, "TRD", trd_doc.content, 42)
+                trd_doc.content = approved_trd
+                trd_doc.status = "approved"
+
+            # Stories
+            await update_progress(project_id, "Stories", 50,
+                "📖 Breaking down User Stories...", "in_progress")
+            await asyncio.sleep(0)
+            await loop.run_in_executor(
+                None, lambda: orchestrator.orchestrate_phase(Phase.STORIES)
+            )
+            # HITL: pause for STORIES review
+            stories_hitl_doc = project_state.docs.get("STORIES")
+            if stories_hitl_doc and stories_hitl_doc.content:
+                approved_stories = await wait_for_human_approval(
+                    project_id, "STORIES", stories_hitl_doc.content, 55
+                )
+                stories_hitl_doc.content = approved_stories
+                stories_hitl_doc.status = "approved"
+
+            # Save docs to disk inside the product directory
+            docs_dir = Path(f"./products/{project_id}/docs")
+            docs_dir.mkdir(parents=True, exist_ok=True)
+            for doc_type in ["BRD", "PRD", "TRD", "STORIES"]:
+                doc = project_state.docs.get(doc_type)
+                if doc and doc.content:
+                    ext = ".json" if doc_type == "STORIES" else ".md"
+                    (docs_dir / f"{doc_type}{ext}").write_text(doc.content)
+                    context_docs[doc_type] = doc.content
+                    logger.info(f"Saved {doc_type} ({len(doc.content)} chars)")
+
+            # Parse stories from the STORIES document JSON
+            stories_doc = project_state.docs.get("STORIES")
+            if stories_doc and stories_doc.content:
+                try:
+                    content = stories_doc.content
+                    # Strip markdown code fences if present
+                    if content.strip().startswith("```"):
+                        # Remove ```json or ``` from start
+                        content = content.strip()
+                        if content.startswith("```json"):
+                            content = content[7:]  # Remove ```json
+                        elif content.startswith("```"):
+                            content = content[3:]  # Remove ```
+                        # Remove closing ```
+                        if content.endswith("```"):
+                            content = content[:-3]
+                        content = content.strip()
+
+                    stories_data = json.loads(content)
+                    # Convert to Story objects
+                    stories = [Story(**story) for story in stories_data]
+                    logger.info(f"✓ Parsed {len(stories)} stories from STORIES doc")
+                except (json.JSONDecodeError, ValueError, Exception) as e:
+                    logger.warning(f"⚠ Could not parse STORIES as Story objects ({type(e).__name__}: {str(e)[:100]}); using single-story fallback")
+                    stories = None
+
+        # ── Fallback: single story if docs skipped or STORIES parse failed ──
+        if not stories:
+            story_name = rough_idea.strip().rstrip('.').title()
+            if len(story_name) > 60:
+                story_name = story_name[:57] + "..."
+
+            # Generate a default LLM prompt based on rough_idea
+            llm_prompt = f"""Implement a product based on the following description:
+
+{rough_idea}
+
+Create the complete implementation (both backend and frontend as needed) that matches this description.
+Ensure the code is production-ready, includes error handling, and is well-documented."""
+
+            stories = [Story(
+                id="story_001",
+                name=story_name,
+                description=rough_idea,
+                llm_prompt=llm_prompt,
+                tech_suggestions={},  # Will be determined by code generators
+                depends_on=[],
+                sequence_order=1,
+                success_criteria=["Implementation complete"],
+            )]
+
+        # ── Code generation phase ──────────────────────────────────────────────
+        # Determine provider label based on actual provider (not LiteLLM format)
+        if llm_api_base and "inceptionlabs.ai" in llm_api_base:
+            provider_label = "Inception Mercury-2"
+        else:
+            provider_label = llm_model.split("/")[0].capitalize()
+        await update_progress(project_id, "Code", 55,
+            f"⚙️ Generating code with {provider_label}...", "in_progress")
+        await asyncio.sleep(0)
+
+        # Build a thread-safe story-progress callback
+        def _story_callback(story_index: int, total_stories: int, story_name: str, status_msg: str):
+            pct = 60 + int(30 * story_index / max(total_stories, 1))
+            msg = f"Story {story_index} of {total_stories} — {story_name}: {status_msg}"
+            asyncio.run_coroutine_threadsafe(
+                update_progress(project_id, "Code", pct, msg, "in_progress"),
+                loop,
+            )
+
         product_generator_config = ProductGeneratorConfig(
-            llm_model="openrouter/meta-llama/llama-3.3-70b-instruct:free",  # OpenRouter Llama
-            api_key=os.getenv("OPENROUTER_API_KEY"),
+            llm_model=llm_model,
+            api_key=llm_api_key,
+            api_base=llm_api_base,
             max_retries=2,
-            run_tests=False,  # Skip tests for faster generation
-            worker_pool_size=2
+            run_tests=False,
+            worker_pool_size=2,
+            progress_callback=_story_callback,
         )
-
         generator = ProductGenerator(config=product_generator_config)
-
-        # Generate product
-        await update_progress(
-            project_id,
-            "Generating Frontend Code",
-            70,
-            "Generating frontend code with vanilla JavaScript...",
-            "in_progress"
-        )
 
         product_path = await generator.generate_product(
             project_id=project_id,
             stories=stories,
-            context_docs={}
+            context_docs=context_docs,
         )
 
-        await update_progress(
-            project_id,
-            "Assembling Product",
-            85,
-            "Assembling product files...",
-            "in_progress"
-        )
-
-        await update_progress(
-            project_id,
-            "Complete",
-            100,
-            "Product generation complete! ✅",
-            "completed"
-        )
-
-        return {
-            "project_id": project_id,
-            "product_path": product_path,
-            "status": "success"
-        }
+        await update_progress(project_id, "Complete", 100,
+            "✅ Product generation complete!", "completed",
+            extra={"product_path": product_path})
 
     except Exception as e:
         logger.error(f"Error generating product: {str(e)}", exc_info=True)
-        await update_progress(
-            project_id,
-            "Failed",
-            0,
-            f"Error: {str(e)}",
-            "failed"
-        )
-        raise HTTPException(status_code=500, detail=str(e))
+        await update_progress(project_id, "Failed", 0, f"Error: {str(e)}", "failed")
+
+
+@app.post("/api/generate")
+async def generate_product(request: GenerationRequest):
+    """Launch product generation as a background task; returns immediately."""
+    if not request.rough_idea or not request.rough_idea.strip():
+        raise HTTPException(status_code=400, detail="Rough idea is required")
+
+    if not request.project_id or not request.project_id.strip():
+        project_id = f"project_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    else:
+        project_id = request.project_id.strip().lower().replace(" ", "_").replace("-", "_")
+
+    logger.info(f"Starting generation for project: {project_id}")
+
+    # Ensure progress queue exists before task starts
+    if project_id not in progress_queues:
+        progress_queues[project_id] = asyncio.Queue()
+
+    # Determine LLM model and API configuration
+    llm_api_base = None
+    if request.llm_provider == "ollama":
+        llm_model = f"ollama/{request.llm_model or 'qwen3.5:7b'}"
+        llm_api_key = None
+    elif request.llm_provider == "inception":
+        # Inception API is OpenAI-compatible — use openai prefix with custom base URL
+        llm_model = "openai/mercury-2"
+        llm_api_key = os.getenv("INCEPTION_API_KEY")
+        llm_api_base = "https://api.inceptionlabs.ai/v1"
+    else:  # openrouter
+        llm_model = f"openrouter/{request.llm_model or 'meta-llama/llama-3.3-70b-instruct:free'}"
+        llm_api_key = os.getenv("OPENROUTER_API_KEY")
+
+    logger.info(f"Using LLM: {llm_model} (provider: {request.llm_provider})")
+
+    mode = "skipping docs" if request.skip_documents else "BRD → PRD → TRD → Stories → Code"
+    await update_progress(project_id, "Initializing", 2,
+                           f"Starting ({mode}) with {llm_model}...", "in_progress")
+
+    # Launch as background task — returns immediately, SSE streams all progress
+    asyncio.create_task(_run_generation_task(
+        project_id, request.rough_idea, llm_model, llm_api_key,
+        skip_documents=request.skip_documents,
+        llm_api_base=llm_api_base,
+    ))
+
+    return {"project_id": project_id, "status": "started"}
 
 
 @app.get("/api/status/{project_id}")
@@ -925,6 +1445,50 @@ async def get_status(project_id: str):
     if project_id not in generation_status:
         raise HTTPException(status_code=404, detail="Project not found")
     return generation_status[project_id]
+
+
+@app.get("/product/{project_id}/{full_path:path}")
+async def serve_product_file(project_id: str, full_path: str):
+    """Serve generated product files via HTTP."""
+    product_dir = Path("./products") / project_id / full_path
+
+    if not product_dir.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if product_dir.is_file():
+        return FileResponse(product_dir)
+
+    # If it's a directory with index.html, serve that
+    index = product_dir / "index.html"
+    if index.exists():
+        return FileResponse(index)
+
+    raise HTTPException(status_code=404, detail="Not a file")
+
+
+@app.post("/api/open-folder/{project_id}")
+async def open_folder(project_id: str):
+    """Open the product directory in Finder/Explorer."""
+    product_dir = Path("./products") / project_id
+
+    if not product_dir.exists():
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        import subprocess
+        import platform
+
+        if platform.system() == "Darwin":  # macOS
+            subprocess.Popen(["open", str(product_dir)])
+        elif platform.system() == "Windows":
+            subprocess.Popen(["explorer", str(product_dir)])
+        else:  # Linux
+            subprocess.Popen(["xdg-open", str(product_dir)])
+
+        return {"status": "opened"}
+    except Exception as e:
+        logger.error(f"Failed to open folder: {e}")
+        raise HTTPException(status_code=500, detail="Failed to open folder")
 
 
 def main():

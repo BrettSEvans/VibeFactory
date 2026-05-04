@@ -258,6 +258,79 @@ class ProductGenerationTestSuite:
 
         return export_path
 
+    def test_ui_content_sanitization(self):
+        """Test that UI content is sanitized to remove TRD technical info."""
+        print("\nTesting UI content sanitization...")
+
+        product = ProductAssemblyManager(
+            project_id="test_sanitization",
+            root_dir=self.temp_dir
+        )
+        product.initialize_product_structure()
+
+        # Add UI content with TRD technical markers
+        technical_content = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Page</title>
+</head>
+<body>
+    <h1>Welcome to the Cheese Shop</h1>
+    <p>Technical Specification: This page uses FastAPI backend with JWT authentication.</p>
+    <p>Architecture: Microservices with PostgreSQL database.</p>
+    <p>Customer-facing content: Browse our selection of artisan cheeses.</p>
+</body>
+</html>
+"""
+
+        product.add_frontend_component("test", "index.html", technical_content)
+
+        # Verify sanitization
+        sanitized_path = product.frontend_dir / "index.html"
+        sanitized_content = sanitized_path.read_text()
+
+        # Check that technical markers are removed
+        assert "Technical Specification" not in sanitized_content, "Should remove Technical Specification"
+        assert "Architecture" not in sanitized_content, "Should remove Architecture"
+        assert "FastAPI" not in sanitized_content, "Should remove FastAPI"
+        assert "JWT" not in sanitized_content, "Should remove JWT"
+        assert "PostgreSQL" not in sanitized_content, "Should remove PostgreSQL"
+
+        # Check that customer-facing content remains
+        assert "Welcome to the Cheese Shop" in sanitized_content, "Should keep customer content"
+        assert "Browse our selection of artisan cheeses" in sanitized_content, "Should keep customer content"
+
+        print("✓ UI content sanitization test passed")
+
+    def test_readme_uses_prd(self):
+        """Test that README uses PRD content, not TRD."""
+        print("\nTesting README uses PRD content...")
+
+        prd_content = "Welcome to our artisan cheese shop! We offer the finest selection of handcrafted cheeses from local farms."
+        trd_content = "Backend: FastAPI with PostgreSQL. Architecture: Microservices. Database schema: Users table with id, name, email fields."
+
+        product = ProductAssemblyManager(
+            project_id="test_readme",
+            root_dir=self.temp_dir,
+            context_docs={"PRD": prd_content, "TRD": trd_content}
+        )
+        product.initialize_product_structure()
+        product.register_story("test", {"name": "Test Story", "description": "Test description"})
+        export_path = product.export_product()
+
+        readme_path = Path(export_path) / "README.md"
+        readme_content = readme_path.read_text()
+
+        # Check that PRD content is included
+        assert "artisan cheese shop" in readme_content.lower(), "Should include PRD content"
+
+        # Check that TRD technical content is not included (specifically the schema details)
+        assert "Users table" not in readme_content, "Should not include TRD schema details"
+        assert "id, name, email fields" not in readme_content, "Should not include TRD field details"
+
+        print("✓ README uses PRD content test passed")
+
     def test_end_to_end_integration(self):
         """Test complete pipeline from rough idea to product."""
         print("\nTesting End-to-End Integration...")

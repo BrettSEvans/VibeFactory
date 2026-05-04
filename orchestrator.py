@@ -37,7 +37,11 @@ class OrchestratorConfig(BaseModel):
     )
     api_key: Optional[str] = Field(
         default=None,
-        description="API key for LLM provider (OpenRouter API key)"
+        description="API key for LLM provider (OpenRouter, OpenAI, Inception, etc.)"
+    )
+    api_base: Optional[str] = Field(
+        default=None,
+        description="Custom API base URL for OpenAI-compatible providers (e.g., Inception)"
     )
     max_retries: int = Field(default=3, ge=1, description="Maximum critique retries")
     pass_score: int = Field(default=7, ge=1, le=10, description="Minimum score to pass")
@@ -126,7 +130,13 @@ class BlindOrchestrator:
 * SHOULD provide exact versions for all libraries in requirements.txt format (e.g., fastapi==0.104.1).
 * SHOULD match architectural complexity to product scope — a one-page HTML flyer MUST NOT specify FastAPI, SQLAlchemy, or databases. Simple products get simple stacks.
 * SHOULD flag is_blocker=True if the PRD requires real-time capabilities or hardware access that cannot be achieved in the proposed stack.
-* SHOULD define the API contract (endpoints, methods, payloads) with precision — or explicitly state "No API required" for static products."""
+* SHOULD define the API contract (endpoints, methods, payloads) with precision — or explicitly state "No API Required" for static products.
+* CRITICAL: Include a "Tech Stack Summary" section at the end with these exact fields (for Stories extraction):
+  - Backend Technology: [e.g., "FastAPI", "Flask", "Static HTML Only"]
+  - Frontend Technology: [e.g., "React", "Vanilla JS", "Static HTML"]
+  - Database: [e.g., "PostgreSQL", "SQLite", "None"]
+  - Authentication: [e.g., "JWT", "OAuth", "None"]
+  - API Style: [e.g., "REST", "GraphQL", "None"]"""
 
     TRD_GENERATOR_USER = "Create a TRD. Define system architecture, DB schema, API endpoints, and pip dependencies. PRD: {source_material}"
 
@@ -144,18 +154,44 @@ class BlindOrchestrator:
     TRD_CRITIC_USER = "Evaluate this TRD. Are there technical impossibilities? If flawed, flag is_blocker=True. PRD: {source_material}. TRD: {draft}."
 
     # Phase 4: STORIES Prompts
-    STORIES_GENERATOR_SYS = """You are an Agile Scrum Master.
+    STORIES_GENERATOR_SYS = """You are an Agile Scrum Master who converts technical requirements into executable code generation prompts.
 
 **Available Skills:**
 * **edge_case_analyzer**: Identify missing user paths, boundary conditions, and dependency gaps in the story list before finalization.
 
-**Rules of Conduct:**
+**Critical Rules of Conduct:**
+* EACH STORY MUST INCLUDE AN EMBEDDED LLM PROMPT: Code generators will use these prompts directly to build the feature. Be explicit about what to build.
+* EXTRACT tech_suggestions FROM THE TRD: If TRD mentions specific stack (React, FastAPI, PostgreSQL, etc.), include those hints in each story's tech_suggestions.
 * SHOULD break the TRD into the minimum number of stories needed to deliver the product — avoid over-splitting simple features.
 * SHOULD ensure each story's success_criteria are specific and testable, not vague.
 * SHOULD define depends_on accurately — circular dependencies are a blocker.
+* SHOULD assign sequence_order to enable sequential building: story with lowest number builds first.
 * SHOULD NOT generate stories for features not specified in the TRD."""
 
-    STORIES_GENERATOR_USER = "Break the TRD into granular User Stories. Output JSON list with: id, name, description, depends_on (list of IDs), and success_criteria. TRD: {source_material}"
+    STORIES_GENERATOR_USER = """Break the TRD into User Stories that code generators will execute directly.
+
+PRODUCT CONTEXT (use to understand scope and complexity):
+PRD: {prd_context}
+
+TECHNICAL REQUIREMENTS:
+TRD: {trd_context}
+
+OUTPUT JSON list with EXACTLY these fields per story:
+- id: unique identifier
+- name: story name
+- description: user-facing description
+- llm_prompt: **EXPLICIT prompt for code generator** (e.g., "Create a login form using React that calls /api/login endpoint and stores JWT in localStorage")
+- success_criteria: testable acceptance criteria (list)
+- tech_suggestions: dict of tech hints extracted from TRD's Tech Stack Summary (e.g., {{"backend_tech": "FastAPI", "database": "PostgreSQL", "auth": "JWT"}})
+- depends_on: list of story IDs this depends on (empty list if no dependencies)
+- sequence_order: integer for execution order (1, 2, 3, ...)
+
+CRITICAL RULES:
+- The llm_prompt MUST be specific enough that a code generator can implement it without guessing.
+- The tech_suggestions MUST be extracted from the TRD's "Tech Stack Summary" section, not heuristics.
+- Each story's sequence_order determines build order: lower numbers build first.
+- Use depends_on to indicate story dependencies (e.g., story_2 might depend_on ["story_1"]).
+- For static/frontend-only products (no backend in TRD), only generate frontend stories."""
 
     STORIES_CRITIC_SYS = """You are a strict Agile QA Auditor.
 
@@ -168,7 +204,18 @@ class BlindOrchestrator:
 * SHOULD prioritize "Correctness" and "Completeness" over "Politeness."
 * SHOULD flag is_blocker=True if depends_on graphs contain cycles, if success_criteria are untestable, or if stories reference features not in the TRD."""
 
-    STORIES_CRITIC_USER = "Evaluate stories. Are depends_on graphs logically sound? TRD: {source_material}. Stories: {draft}."
+    STORIES_CRITIC_USER = """Evaluate these user stories against the TRD.
+
+TRD (Source of Truth): {source_material}
+
+STORIES TO EVALUATE: {draft}
+
+Check for:
+- Are depends_on graphs logically sound (no cycles)?
+- Are tech_suggestions correctly extracted from TRD's Tech Stack Summary?
+- Are sequence_order values in ascending order (1, 2, 3...)?
+- Are success_criteria testable and specific?
+- Do all stories collectively cover the TRD requirements?"""
 
     def __init__(
         self,
@@ -230,12 +277,13 @@ class BlindOrchestrator:
 
         # Run the critique loop
         success, document = self._run_critique_loop(phase, source_material, prev_doc)
-        
+
+        # Always persist the document (approved or stale) so downstream phases have context
+        # and so that the web UI can save even partially-approved documents to disk.
+        self.state.set_document(phase.value, document)
+
         if success:
-            # Update state
-            self.state.set_document(phase.value, document)
-            
-            # Update current phase
+            # Advance the current phase marker
             if phase == Phase.BRD:
                 self.state.current_phase = Phase.PRD.value
             elif phase == Phase.PRD:
@@ -295,17 +343,36 @@ class BlindOrchestrator:
                     phase, source_material, prev_doc, draft_content
                 )
 
-            # Step 2: Self-Critique (same session)
-            self_critique = self._self_critique(phase, source_material, draft_content)
-            
-            # Apply self-critique improvements
-            if self_critique and not self_critique.passed:
-                draft_content = self._apply_self_critique(
-                    phase, source_material, draft_content, self_critique
+            # Step 2: Self-Critique (same session) — optional; skip if model can't handle it
+            try:
+                self_critique = self._self_critique(phase, source_material, draft_content)
+                if self_critique and not self_critique.passed:
+                    draft_content = self._apply_self_critique(
+                        phase, source_material, draft_content, self_critique
+                    )
+            except Exception as e:
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    f"Self-critique failed for {phase.value} ({type(e).__name__}); skipping"
                 )
 
             # Step 3: Blind Critique (NEW session, no chat history)
-            blind_critique = self._blind_critique(phase, source_material, draft_content)
+            # If the model can't produce structured critique output, accept the draft as-is.
+            try:
+                blind_critique = self._blind_critique(phase, source_material, draft_content)
+            except Exception as e:
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    f"Blind critique failed for {phase.value} ({type(e).__name__}); accepting draft"
+                )
+                doc = Document(
+                    content=draft_content,
+                    version=1,
+                    critiques=[],
+                    status="approved",
+                )
+                self.state.set_document(phase.value, doc)
+                return True, doc
 
             # Step 4: Resolution
             if blind_critique.passed and blind_critique.score >= self.config.pass_score:
@@ -313,7 +380,10 @@ class BlindOrchestrator:
                 doc = Document(
                     content=draft_content,
                     version=1,
-                    critiques=[blind_critique],
+                    critiques=[CritiqueEntry(
+                        agent_name="blind-critic",
+                        feedback=blind_critique.feedback,
+                    )],
                     status="approved"
                 )
                 return True, doc
@@ -381,19 +451,36 @@ class BlindOrchestrator:
             ]
         
         elif phase == Phase.STORIES:
-            user_prompt = self.STORIES_GENERATOR_USER.format(source_material=source_material)
+            # For STORIES, we need both PRD and TRD context
+            prd_doc = self.state.get_document("PRD") if self.state else None
+            trd_doc = self.state.get_document("TRD") if self.state else None
+
+            prd_content = prd_doc.content if prd_doc else "Not available"
+            trd_content = trd_doc.content if trd_doc else source_material  # Fall back to source_material if TRD not found
+
+            user_prompt = self.STORIES_GENERATOR_USER.format(
+                prd_context=prd_content[:500],  # Truncate aggressively to avoid token bloat
+                trd_context=source_material  # source_material IS the TRD in this context
+            )
             messages = [
                 {"role": "system", "content": self.STORIES_GENERATOR_SYS},
                 {"role": "user", "content": user_prompt}
             ]
-        
-        response = self.client.chat.completions.create(
-            model=self.config.llm_model,
-            messages=messages,
-            max_tokens=8000,
-            temperature=0.7
-        )
-        
+
+        completion_kwargs = {
+            "model": self.config.llm_model,
+            "messages": messages,
+            "max_tokens": 8000,
+            "temperature": 0.7,
+            "api_key": self.api_key,
+            "timeout": 90,      # Hard cap: prevents infinite hang (was unbounded)
+            "num_retries": 2,   # LiteLLM internal retries; was 5 (5×90s = 7.5min per call)
+        }
+        if self.config.api_base:
+            completion_kwargs["api_base"] = self.config.api_base
+
+        response = litellm.completion(**completion_kwargs)
+
         return response.choices[0].message.content
 
     def _self_critique(
@@ -569,30 +656,44 @@ class BlindOrchestrator:
             ]
         
         elif phase == Phase.STORIES:
+            # Get PRD context for regeneration
+            prd_doc = self.state.get_document("PRD") if self.state else None
+            prd_content = prd_doc.content if prd_doc else "Not available"
+
             user_prompt = f"""
             Previous stories draft had issues. Revise it:
-            
-            TRD: {source_material}
-            
+
+            PRODUCT CONTEXT (PRD): {prd_content[:1000]}
+
+            TECHNICAL REQUIREMENTS (TRD): {source_material}
+
             Previous Draft:
             {current_draft}
-            
+
             Feedback: {feedback_text}
-            
-            Create improved user stories with better dependency graphs.
+
+            Create improved user stories with better dependency graphs, clearer llm_prompts,
+            and tech_suggestions extracted from the TRD Tech Stack Summary.
             """
             messages = [
                 {"role": "system", "content": self.STORIES_GENERATOR_SYS},
                 {"role": "user", "content": user_prompt}
             ]
-        
-        response = self.client.chat.completions.create(
-            model=self.config.llm_model,
-            messages=messages,
-            max_tokens=8000,
-            temperature=0.7
-        )
-        
+
+        completion_kwargs = {
+            "model": self.config.llm_model,
+            "messages": messages,
+            "max_tokens": 8000,
+            "temperature": 0.7,
+            "api_key": self.api_key,
+            "timeout": 90,      # Hard cap: prevents infinite hang (was unbounded)
+            "num_retries": 2,   # LiteLLM internal retries; was 5 (5×90s = 7.5min per call)
+        }
+        if self.config.api_base:
+            completion_kwargs["api_base"] = self.config.api_base
+
+        response = litellm.completion(**completion_kwargs)
+
         return response.choices[0].message.content
 
     def _apply_self_critique(
@@ -613,17 +714,24 @@ class BlindOrchestrator:
         
         Provide the improved version.
         """
-        
-        response = self.client.chat.completions.create(
-            model=self.config.llm_model,
-            messages=[
+
+        completion_kwargs = {
+            "model": self.config.llm_model,
+            "messages": [
                 {"role": "system", "content": "You are a document improvement specialist."},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=8000,
-            temperature=0.5
-        )
-        
+            "max_tokens": 8000,
+            "temperature": 0.5,
+            "api_key": self.api_key,
+            "timeout": 90,      # Hard cap: prevents infinite hang (was unbounded)
+            "num_retries": 2,   # LiteLLM internal retries; was 5 (5×90s = 7.5min per call)
+        }
+        if self.config.api_base:
+            completion_kwargs["api_base"] = self.config.api_base
+
+        response = litellm.completion(**completion_kwargs)
+
         return response.choices[0].message.content
 
     def _get_target_phase_on_failure(self, phase: Phase) -> str:

@@ -12,7 +12,7 @@ This module integrates:
 
 import asyncio
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
 import json
@@ -20,6 +20,7 @@ import json
 from state import ProjectState
 from sandbox import ProjectSandbox, CommandResult
 from story_translator import StoryTranslator, BackendSpec, FrontendSpec
+from state import Story
 from backend_generator import BackendGenerator, BackendGeneratorConfig
 from frontend_generator import FrontendGenerator, FrontendGeneratorConfig
 from product_assembly import ProductAssemblyManager
@@ -69,10 +70,16 @@ class ProductGeneratorConfig(BaseModel):
         default="meta-llama/llama-3.3-70b-instruct:free",
         description="LLM model for code generation"
     )
-    api_key: Optional[str] = Field(default=None, description="API key for LLM")
+    api_key: Optional[str] = Field(default=None, description="API key for LLM provider")
+    api_base: Optional[str] = Field(default=None, description="Custom API base URL for OpenAI-compatible providers")
     max_retries: int = Field(default=3, ge=1, description="Max generation retries")
     run_tests: bool = Field(default=True, description="Run tests after generation")
     worker_pool_size: int = Field(default=4, ge=1, description="Parallel execution workers")
+    # Optional callback: (story_index: int, total_stories: int, story_name: str, status_msg: str) -> None
+    # Called at key moments during story generation for real-time progress reporting.
+    progress_callback: Optional[Any] = Field(default=None, exclude=True)
+
+    model_config = {"arbitrary_types_allowed": True}
 
 
 class ProductGenerator:
@@ -89,7 +96,7 @@ class ProductGenerator:
        e) Testing: Run tests and validate (skipped for static frontends)
 
     2. After all stories:
-       a) Update navigation with registered pages (dashboard only for multi-page apps)
+       a) Update navigation with registered pages
        b) Create docker-compose.yml (skipped for static products)
        c) Export final product
     """
@@ -150,13 +157,15 @@ Provide validation results."""
         self.backend_generator = BackendGenerator(
             BackendGeneratorConfig(
                 llm_model=self.config.llm_model,
-                api_key=self.config.api_key
+                api_key=self.config.api_key,
+                api_base=self.config.api_base
             )
         )
         self.frontend_generator = FrontendGenerator(
             FrontendGeneratorConfig(
                 llm_model=self.config.llm_model,
-                api_key=self.config.api_key
+                api_key=self.config.api_key,
+                api_base=self.config.api_base
             )
         )
 
@@ -171,7 +180,7 @@ Provide validation results."""
     async def generate_product(
         self,
         project_id: str,
-        stories: List[Dict],
+        stories: List[Story],
         context_docs: Optional[Dict[str, str]] = None,
     ) -> str:
         """
@@ -179,7 +188,7 @@ Provide validation results."""
 
         Args:
             project_id: Unique project identifier
-            stories: List of story dictionaries
+            stories: List of Story objects (with embedded LLM prompts)
             context_docs: Optional context documents (PRD, TRD)
 
         Returns:
@@ -189,10 +198,11 @@ Provide validation results."""
         print(f"PRODUCT GENERATION: {project_id}")
         print("=" * 70)
 
-        # Initialize product assembly manager
+        # Initialize product assembly manager with context docs for PRD-based README
         product = ProductAssemblyManager(
             project_id=project_id,
-            root_dir=self.product_dir
+            root_dir=self.product_dir,
+            context_docs=context_docs
         )
 
         # Feed TRD content to story translator so it can detect product type
@@ -206,11 +216,9 @@ Provide validation results."""
         if product_needs_backend:
             product.initialize_product_structure()
         else:
-            # Static products only need the frontend directory
+            # Static products (ads, flyers, promos): only a bare frontend dir.
+            # NO nav.js / api.js / pages/ scaffold — the generator writes a single index.html.
             product.frontend_dir.mkdir(parents=True, exist_ok=True)
-            (product.frontend_dir / "js").mkdir(parents=True, exist_ok=True)
-            (product.frontend_dir / "pages").mkdir(parents=True, exist_ok=True)
-            product._create_frontend_scaffold()
 
         # Execute stories with dependency resolution
         completed_ids = await self._execute_stories_sequential(
@@ -228,7 +236,7 @@ Provide validation results."""
 
     async def _execute_stories_sequential(
         self,
-        stories: List[Dict],
+        stories: List[Story],
         product: ProductAssemblyManager,
         context_docs: Optional[Dict[str, str]] = None,
     ) -> set:
@@ -236,7 +244,7 @@ Provide validation results."""
         Execute stories sequentially respecting dependencies.
 
         Args:
-            stories: List of stories to execute
+            stories: List of Story objects (with embedded LLM prompts)
             product: ProductAssemblyManager instance
             context_docs: Optional context documents
 
@@ -246,17 +254,20 @@ Provide validation results."""
         print("\n[1/5] Generating Backend & Frontend from Stories...")
 
         # Build dependency graph
-        dependency_graph = {s.get("id", f"story_{i}"): s.get("depends_on", []) for i, s in enumerate(stories)}
+        dependency_graph = {s.id: s.depends_on for s in stories}
 
+        total_stories = len(stories)
         completed_ids = set()
         pending = list(stories)
         wave = 1
+        # Track global story index (1-based) for progress reporting
+        story_index_map = {s.id: i + 1 for i, s in enumerate(stories)}
 
         while pending:
-            # Find stories ready to execute
+            # Find stories ready to execute (all dependencies completed)
             ready = [
                 s for s in pending
-                if all(dep in completed_ids for dep in s.get("depends_on", []))
+                if all(dep in completed_ids for dep in s.depends_on)
             ]
 
             if not ready:
@@ -270,7 +281,11 @@ Provide validation results."""
 
             async def limited_generate(story):
                 async with semaphore:
-                    return await self._generate_story(story, product, context_docs)
+                    idx = story_index_map[story.id]
+                    return await self._generate_story(
+                        story, product, context_docs,
+                        story_index=idx, total_stories=total_stories
+                    )
 
             results = await asyncio.gather(
                 *[limited_generate(s) for s in ready],
@@ -292,31 +307,47 @@ Provide validation results."""
                 else:
                     print(f"  ✗ {story_id}: {result.error_message}")
 
-            # Remove completed stories
-            pending = [s for s in pending if s.get("id") not in completed_ids]
+            # Remove completed stories from pending list
+            pending = [s for s in pending if s.id not in completed_ids]
             wave += 1
 
         return completed_ids
 
     async def _generate_story(
         self,
-        story: Dict,
+        story: Story,
         product: ProductAssemblyManager,
         context_docs: Optional[Dict[str, str]] = None,
+        story_index: int = 0,
+        total_stories: int = 0,
     ) -> StoryGeneration:
         """
         Generate backend and frontend code for a single story.
 
+        Uses the story's embedded llm_prompt to guide code generation directly,
+        rather than trying to infer complexity.
+
         Args:
-            story: Story definition
+            story: Story object with embedded LLM prompt for code generators
             product: ProductAssemblyManager instance
             context_docs: Optional context documents
+            story_index: 1-based position of this story in the full list
+            total_stories: Total number of stories being generated
 
         Returns:
             StoryGeneration result
         """
-        story_id = story.get("id", f"story_{story.get('name', 'unknown')}")
-        story_name = story.get("name", "")
+        story_id = story.id
+        story_name = story.name
+
+        def _cb(msg: str):
+            """Fire progress callback if configured."""
+            cb = self.config.progress_callback
+            if cb and story_index and total_stories:
+                try:
+                    cb(story_index, total_stories, story_name, msg)
+                except Exception:
+                    pass
 
         result = StoryGeneration(
             story_id=story_id,
@@ -327,6 +358,7 @@ Provide validation results."""
         try:
             # Step 1: Translate story to specifications
             result.status = ProductGenerationStatus.TRANSLATING
+            _cb("🔄 Translating story to specs")
             backend_spec, frontend_spec = self.story_translator.translate_story(
                 story, context_docs
             )
@@ -336,6 +368,7 @@ Provide validation results."""
             # Step 2: Generate backend code (skip for static products)
             result.status = ProductGenerationStatus.GENERATING_BACKEND
             if backend_spec.requires_backend:
+                _cb("⚙️ Generating backend code")
                 backend_code = self.backend_generator.integrate_with_product(
                     backend_spec, "", context_docs
                 )
@@ -345,6 +378,7 @@ Provide validation results."""
 
             # Step 3: Generate frontend code
             result.status = ProductGenerationStatus.GENERATING_FRONTEND
+            _cb("🎨 Generating frontend code")
             frontend_code = self.frontend_generator.integrate_with_product(
                 frontend_spec, "", context_docs
             )
@@ -390,17 +424,19 @@ Provide validation results."""
                 story_id,
                 {
                     "name": story_name,
-                    "description": story.get("description", ""),
+                    "description": story.description,
                     "endpoints": [e.path for e in backend_spec.endpoints],
                     "pages": [p.route for p in frontend_spec.pages],
                 }
             )
 
             result.status = ProductGenerationStatus.COMPLETED
+            _cb("✅ Done")
 
         except Exception as e:
             result.status = ProductGenerationStatus.FAILED
             result.error_message = str(e)
+            _cb(f"❌ Failed: {str(e)[:80]}")
 
         return result
 
@@ -433,25 +469,24 @@ Provide validation results."""
 
     def _product_needs_backend(
         self,
-        stories: List[Dict],
+        stories: List[Story],
         context_docs: Optional[Dict[str, str]] = None
     ) -> bool:
         """
         Quick check: does ANY story in this product require a backend?
-        Uses story translator's static-product detection.
+        Uses story translator's detection logic based on PRD/TRD context.
         """
         for story in stories:
-            description = story.get("description", story.get("name", ""))
-            success_criteria = story.get("success_criteria", [])
+            description = story.description or story.name
+            success_criteria = story.success_criteria or []
             if self.story_translator._needs_backend(description, success_criteria, context_docs or {}):
                 return True
         return False
 
     def _generate_mandatory_ui(self, product: ProductAssemblyManager) -> None:
         """
-        Update navigation and generate overview page if applicable.
+        Update navigation based on registered pages.
         - Always: update nav.js with registered pages
-        - Multi-page apps only: generate overview/dashboard page
         - API explorer only generated for backend products
         """
         try:
