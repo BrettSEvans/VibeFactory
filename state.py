@@ -3,6 +3,7 @@ Module 1: Global State Management
 Core schema for the multi-agent SDLC system using Pydantic.
 """
 
+import re
 from datetime import datetime
 from typing import ClassVar, Dict, List, Optional
 from pydantic import BaseModel, Field, ConfigDict
@@ -190,3 +191,127 @@ class ProjectState(BaseModel):
     def from_json(cls, json_str: str) -> "ProjectState":
         """Deserialize JSON string to ProjectState."""
         return cls.model_validate_json(json_str)
+
+
+# ============================================================================
+# Story Markdown Serialization/Deserialization
+# ============================================================================
+# For Dual Story Sets: Frontend Stories (from PRD) and Backend Stories (from TRD)
+# These helpers convert between Story objects and markdown format for HITL review
+
+
+def stories_to_markdown(stories: List[Story], story_type: str = "backend") -> str:
+    """
+    Convert a list of Story objects to markdown format.
+
+    Args:
+        stories: List of Story objects to convert
+        story_type: Either "frontend" or "backend" - affects header and coupling terminology
+
+    Returns:
+        Markdown string representation of the stories
+    """
+    out = [f"# {story_type.title()} Stories", ""]
+
+    for s in stories:
+        depends = ", ".join(s.depends_on) if s.depends_on else "none"
+        crit = "\n".join(f"- {c}" for c in s.success_criteria) if s.success_criteria else "- (none)"
+
+        # Frontend stories show "Backend Stories Required", backend show "Frontend Stories Using This"
+        coupling_label = "Backend Stories Required" if story_type == "frontend" else "Frontend Stories Using This"
+        coupling_value = s.description if s.description else "none"
+
+        out += [
+            f"## {story_type.title()} Story {s.id}: {s.name}\n",
+            f"**Sequence:** {s.sequence_order}",
+            f"**Depends On:** {depends}",
+            f"**{coupling_label}:** {coupling_value}\n",
+            "### Specification",
+            s.llm_prompt.strip(),
+            "",
+            "### Acceptance Criteria",
+            crit,
+            "\n---\n"
+        ]
+
+    return "\n".join(out)
+
+
+def stories_from_markdown(md: str) -> List[Story]:
+    """
+    Parse Story objects from markdown format (frontend or backend).
+
+    Args:
+        md: Markdown string containing stories
+
+    Returns:
+        List of Story objects parsed from the markdown
+    """
+    blocks = re.split(r"\n---\s*\n", md.strip())
+    stories: List[Story] = []
+
+    for block in blocks:
+        # Match "## Frontend Story F1: Name" or "## Backend Story B1: Name"
+        m = re.search(
+            r"^##\s+(?:Frontend|Backend)\s+Story\s+([A-Za-z0-9_]+)\s*:\s*(.+?)\s*$",
+            block,
+            re.MULTILINE
+        )
+        if not m:
+            continue
+
+        sid = m.group(1).strip()
+        name = m.group(2).strip()
+
+        # Extract sequence order
+        seq_match = re.search(r"\*\*Sequence:\*\*\s*(\d+)", block)
+        seq = int(seq_match.group(1)) if seq_match else 0
+
+        # Extract depends_on
+        dep_match = re.search(r"\*\*Depends On:\*\*\s*(.+?)(?:\n|$)", block)
+        dep_raw = dep_match.group(1).strip() if dep_match else "none"
+        depends = (
+            [] if dep_raw.lower() in ("none", "")
+            else [d.strip() for d in dep_raw.split(",") if d.strip()]
+        )
+
+        # Extract coupling (Backend Stories Required / Frontend Stories Using This)
+        coupling_match = re.search(
+            r"\*\*(?:Backend|Frontend) Stories (?:Required|Using This):\*\*\s*(.+?)(?:\n|$)",
+            block
+        )
+        coupling_value = coupling_match.group(1).strip() if coupling_match else ""
+
+        # Extract specification (llm_prompt)
+        spec_match = re.search(
+            r"###\s+Specification\s*\n(.*?)(?=\n###\s+|\Z)",
+            block,
+            re.DOTALL
+        )
+        llm_prompt = spec_match.group(1).strip() if spec_match else ""
+
+        # Extract success criteria
+        crit_match = re.search(
+            r"###\s+Acceptance Criteria\s*\n(.*?)(?=\n###\s+|\Z)",
+            block,
+            re.DOTALL
+        )
+        success_criteria = []
+        if crit_match:
+            for line in crit_match.group(1).splitlines():
+                line = line.strip()
+                if line.startswith("- ") and line[2:].strip().lower() != "(none)":
+                    success_criteria.append(line[2:].strip())
+
+        stories.append(Story(
+            id=sid,
+            name=name,
+            description=coupling_value,  # Stores coupling info for round-trip
+            llm_prompt=llm_prompt,
+            success_criteria=success_criteria,
+            tech_suggestions={},
+            depends_on=depends,
+            sequence_order=seq
+        ))
+
+    return stories
