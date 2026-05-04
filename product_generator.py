@@ -180,16 +180,20 @@ Provide validation results."""
     async def generate_product(
         self,
         project_id: str,
-        stories: List[Story],
+        frontend_stories: Optional[List[Story]] = None,
+        backend_stories: Optional[List[Story]] = None,
         context_docs: Optional[Dict[str, str]] = None,
+        stories: Optional[List[Story]] = None,  # Backward compatibility
     ) -> str:
         """
-        Generate complete product from stories.
+        Generate complete product from dual story sets.
 
         Args:
             project_id: Unique project identifier
-            stories: List of Story objects (with embedded LLM prompts)
+            frontend_stories: Frontend Story objects (from PRD)
+            backend_stories: Backend Story objects (from TRD)
             context_docs: Optional context documents (PRD, TRD)
+            stories: (Legacy) List of Story objects if not using dual sets
 
         Returns:
             Path to generated product
@@ -197,6 +201,17 @@ Provide validation results."""
         print("\n" + "=" * 70)
         print(f"PRODUCT GENERATION: {project_id}")
         print("=" * 70)
+
+        # Handle backward compatibility: if new dual-story params not provided, use legacy stories param
+        if frontend_stories is None and backend_stories is None and stories is not None:
+            # Legacy mode: merge all stories for code generation
+            print("  [Note: Using legacy single-story set]")
+            frontend_stories = stories
+            backend_stories = []
+        elif frontend_stories is None:
+            frontend_stories = []
+        elif backend_stories is None:
+            backend_stories = []
 
         # Initialize product assembly manager with context docs for PRD-based README
         product = ProductAssemblyManager(
@@ -212,7 +227,8 @@ Provide validation results."""
                 self.story_translator.trd_content = trd_content
 
         # Determine if any story needs a backend (used to decide scaffold type)
-        product_needs_backend = self._product_needs_backend(stories, context_docs)
+        all_stories = frontend_stories + backend_stories
+        product_needs_backend = self._product_needs_backend(all_stories, context_docs)
         if product_needs_backend:
             product.initialize_product_structure()
         else:
@@ -220,12 +236,25 @@ Provide validation results."""
             # NO nav.js / api.js / pages/ scaffold — the generator writes a single index.html.
             product.frontend_dir.mkdir(parents=True, exist_ok=True)
 
-        # Execute stories with dependency resolution
-        completed_ids = await self._execute_stories_sequential(
-            stories,
+        # Execute frontend stories with dependency resolution
+        print("\n[1/5] Generating Frontend from Frontend Stories...")
+        frontend_completed_ids = await self._execute_stories_sequential(
+            frontend_stories,
             product,
             context_docs
         )
+
+        # Execute backend stories with dependency resolution (if any)
+        if backend_stories:
+            print("\n[2/5] Generating Backend from Backend Stories...")
+            backend_completed_ids = await self._execute_stories_sequential(
+                backend_stories,
+                product,
+                context_docs
+            )
+        else:
+            print("\n[2/5] No backend stories (static frontend only)")
+            backend_completed_ids = set()
 
         # Export final product (export_product handles navigation update internally)
         print("\n[4/5] Exporting Product...")
