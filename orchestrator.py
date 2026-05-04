@@ -19,6 +19,10 @@ class Phase(Enum):
     PRD = "PRD"
     TRD = "TRD"
     STORIES = "STORIES"
+    # Dual Story Sets approach (new)
+    FRONTEND_STORIES = "FRONTEND_STORIES"
+    BACKEND_STORIES = "BACKEND_STORIES"
+    ARCHITECT_REVIEW = "ARCHITECT_REVIEW"
 
 
 class CritiqueResponse(BaseModel):
@@ -484,7 +488,13 @@ Provide a detailed review covering:
             elif phase == Phase.PRD:
                 self.state.current_phase = Phase.TRD.value
             elif phase == Phase.TRD:
-                self.state.current_phase = Phase.STORIES.value
+                self.state.current_phase = Phase.FRONTEND_STORIES.value  # New: go to dual story generation
+            elif phase == Phase.FRONTEND_STORIES:
+                self.state.current_phase = Phase.BACKEND_STORIES.value
+            elif phase == Phase.BACKEND_STORIES:
+                self.state.current_phase = Phase.ARCHITECT_REVIEW.value
+            elif phase == Phase.ARCHITECT_REVIEW:
+                self.state.current_phase = "IMPLEMENTATION"
             elif phase == Phase.STORIES:
                 self.state.current_phase = "IMPLEMENTATION"
 
@@ -492,12 +502,15 @@ Provide a detailed review covering:
 
     def _get_previous_document(self, phase: Phase) -> Optional[Document]:
         """Get the previous phase's document."""
-        phase_order = [Phase.BRD, Phase.PRD, Phase.TRD, Phase.STORIES]
+        phase_order = [
+            Phase.BRD, Phase.PRD, Phase.TRD, Phase.STORIES,
+            Phase.FRONTEND_STORIES, Phase.BACKEND_STORIES, Phase.ARCHITECT_REVIEW
+        ]
         idx = phase_order.index(phase)
-        
+
         if idx == 0:
             return None
-        
+
         prev_phase = phase_order[idx - 1]
         return self.state.get_document(prev_phase.value)
 
@@ -662,6 +675,57 @@ Provide a detailed review covering:
                 {"role": "user", "content": user_prompt}
             ]
 
+        elif phase == Phase.FRONTEND_STORIES:
+            # Frontend stories: PRD-only context
+            prd_doc = self.state.get_document("PRD") if self.state else None
+            prd_content = prd_doc.content if prd_doc else source_material
+
+            user_prompt = self.FRONTEND_STORIES_GENERATOR_USER.format(
+                prd_context=prd_content,
+                rough_idea=self.state.rough_idea if self.state else ""
+            )
+            messages = [
+                {"role": "system", "content": self.FRONTEND_STORIES_GENERATOR_SYS},
+                {"role": "user", "content": user_prompt}
+            ]
+
+        elif phase == Phase.BACKEND_STORIES:
+            # Backend stories: TRD-only context
+            trd_doc = self.state.get_document("TRD") if self.state else None
+            trd_content = trd_doc.content if trd_doc else source_material
+
+            user_prompt = self.BACKEND_STORIES_GENERATOR_USER.format(
+                trd_context=trd_content,
+                rough_idea=self.state.rough_idea if self.state else ""
+            )
+            messages = [
+                {"role": "system", "content": self.BACKEND_STORIES_GENERATOR_SYS},
+                {"role": "user", "content": user_prompt}
+            ]
+
+        elif phase == Phase.ARCHITECT_REVIEW:
+            # Architect review: needs both story sets and context
+            frontend_stories_doc = self.state.get_document("FRONTEND_STORIES") if self.state else None
+            backend_stories_doc = self.state.get_document("BACKEND_STORIES") if self.state else None
+            prd_doc = self.state.get_document("PRD") if self.state else None
+            trd_doc = self.state.get_document("TRD") if self.state else None
+
+            frontend_stories = frontend_stories_doc.content if frontend_stories_doc else "No frontend stories"
+            backend_stories = backend_stories_doc.content if backend_stories_doc else "No backend stories"
+            prd_content = prd_doc.content if prd_doc else "No PRD"
+            trd_content = trd_doc.content if trd_doc else "No TRD"
+
+            user_prompt = self.ARCHITECT_REVIEW_USER.format(
+                prd=prd_content,
+                trd=trd_content,
+                frontend_stories=frontend_stories,
+                backend_stories=backend_stories
+            )
+            messages = [
+                {"role": "system", "content": self.ARCHITECT_REVIEW_SYS},
+                {"role": "user", "content": user_prompt}
+            ]
+
         completion_kwargs = {
             "model": self.config.llm_model,
             "messages": messages,
@@ -715,7 +779,29 @@ Provide a detailed review covering:
                 draft=draft
             )
             sys_prompt = self.STORIES_CRITIC_SYS
-        
+
+        elif phase == Phase.FRONTEND_STORIES:
+            prd_doc = self.state.get_document("PRD") if self.state else None
+            prd_content = prd_doc.content if prd_doc else "No PRD"
+            user_prompt = self.FRONTEND_STORIES_CRITIC_USER.format(
+                source_material=prd_content,
+                draft=draft
+            )
+            sys_prompt = self.FRONTEND_STORIES_CRITIC_SYS
+
+        elif phase == Phase.BACKEND_STORIES:
+            trd_doc = self.state.get_document("TRD") if self.state else None
+            trd_content = trd_doc.content if trd_doc else "No TRD"
+            user_prompt = self.BACKEND_STORIES_CRITIC_USER.format(
+                source_material=trd_content,
+                draft=draft
+            )
+            sys_prompt = self.BACKEND_STORIES_CRITIC_SYS
+
+        elif phase == Phase.ARCHITECT_REVIEW:
+            # Architect review is display-only, no critique needed
+            return None
+
         try:
             response = self.client.chat.completions.create(
                 model=self.config.llm_model,
@@ -769,6 +855,28 @@ Provide a detailed review covering:
                 draft=draft
             )
             sys_prompt = self.STORIES_CRITIC_SYS
+
+        elif phase == Phase.FRONTEND_STORIES:
+            prd_doc = self.state.get_document("PRD") if self.state else None
+            prd_content = prd_doc.content if prd_doc else "No PRD"
+            user_prompt = self.FRONTEND_STORIES_CRITIC_USER.format(
+                source_material=prd_content,
+                draft=draft
+            )
+            sys_prompt = self.FRONTEND_STORIES_CRITIC_SYS
+
+        elif phase == Phase.BACKEND_STORIES:
+            trd_doc = self.state.get_document("TRD") if self.state else None
+            trd_content = trd_doc.content if trd_doc else "No TRD"
+            user_prompt = self.BACKEND_STORIES_CRITIC_USER.format(
+                source_material=trd_content,
+                draft=draft
+            )
+            sys_prompt = self.BACKEND_STORIES_CRITIC_SYS
+
+        elif phase == Phase.ARCHITECT_REVIEW:
+            # Architect review is display-only, no structured critique
+            return CritiqueResponse(score=10, passed=True, is_blocker=False, feedback="Display-only review")
 
         # CRITICAL: NEW session - no prior messages
         # This ensures unbiased critique
