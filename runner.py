@@ -78,20 +78,85 @@ class LangGraphRunner:
     Main runner using LangGraph FSM to orchestrate the entire SDLC.
     """
 
-    def __init__(self, state_dir: str = None):
+    def __init__(self, state_dir: str = None, model_config: dict = None):
         """
         Initialize the LangGraph runner.
 
         Args:
             state_dir: Directory to save/load state (default: ./sdlc_state)
+            model_config: Dictionary with 'provider' and 'model' keys
         """
         self.state_dir = state_dir or "./sdlc_state"
         self.graph = None
         self.checkpointer = MemorySaver()
         self.config = None
 
+        # Store model configuration
+        self.model_config = model_config or {
+            'provider': 'OpenRouter',
+            'model': 'meta-llama/llama-3.3-70b-instruct:free'
+        }
+
         # Ensure state directory exists
         os.makedirs(self.state_dir, exist_ok=True)
+
+    def _get_litellm_model(self) -> str:
+        """
+        Convert provider + model to LiteLLM format.
+        LiteLLM infers the provider from the model prefix — it must be explicit.
+        """
+        provider = self.model_config.get('provider', 'OpenRouter')
+        model = self.model_config.get('model', 'meta-llama/llama-3.3-70b-instruct:free')
+
+        if provider == 'OpenRouter':
+            # LiteLLM requires the openrouter/ prefix to route correctly
+            if not model.startswith('openrouter/'):
+                return f"openrouter/{model}"
+            return model
+        elif provider == 'Inception':
+            # Inception is OpenAI-compatible — pass the raw model name (e.g. mercury-2)
+            # and use api_base + api_key to route to Inception's endpoint
+            return model
+        elif provider == 'Local':
+            # Ollama models use the ollama/ prefix
+            if not model.startswith('ollama/'):
+                return f"ollama/{model}"
+            return model
+        else:
+            return model
+
+    def _get_api_base(self) -> str:
+        """Get the API base URL for the provider."""
+        provider = self.model_config.get('provider', 'OpenRouter')
+
+        if provider == 'Inception':
+            # Inception Labs API endpoint
+            return 'https://api.inceptionlabs.ai/v1'
+        elif provider == 'Local':
+            # Ollama endpoint
+            return 'http://localhost:11434/v1'
+        else:
+            # OpenRouter doesn't need a custom api_base
+            return None
+
+    def _setup_provider_env(self) -> None:
+        """
+        Set environment variables for the selected provider.
+        This ensures the correct API key is available to litellm.
+        """
+        provider = self.model_config.get('provider', 'OpenRouter')
+
+        if provider == 'Inception':
+            # Ensure INCEPTION_API_KEY is available
+            if not os.getenv("INCEPTION_API_KEY"):
+                print("⚠️  Warning: INCEPTION_API_KEY not set in environment")
+        elif provider == 'OpenRouter':
+            # Ensure OPENROUTER_API_KEY is available
+            if not os.getenv("OPENROUTER_API_KEY"):
+                print("⚠️  Warning: OPENROUTER_API_KEY not set in environment")
+        elif provider == 'Local':
+            # Local models via Ollama don't need API keys
+            pass
 
     def _get_state_file(self, project_id: str) -> str:
         """Get the state file path for a project."""
@@ -213,8 +278,10 @@ class LangGraphRunner:
 
         try:
             # Initialize orchestrator
+            api_base = self._get_api_base()
             config = OrchestratorConfig(
-                llm_model="gpt-4o",
+                llm_model=self._get_litellm_model(),
+                api_base=api_base,
                 max_retries=3
             )
             orchestrator = BlindOrchestrator(config=config)
@@ -263,8 +330,10 @@ class LangGraphRunner:
 
         try:
             # Initialize orchestrator
+            api_base = self._get_api_base()
             config = OrchestratorConfig(
-                llm_model="gpt-4o",
+                llm_model=self._get_litellm_model(),
+                api_base=api_base,
                 max_retries=3
             )
             orchestrator = BlindOrchestrator(config=config)
@@ -310,8 +379,10 @@ class LangGraphRunner:
 
         try:
             # Initialize orchestrator
+            api_base = self._get_api_base()
             config = OrchestratorConfig(
-                llm_model="gpt-4o",
+                llm_model=self._get_litellm_model(),
+                api_base=api_base,
                 max_retries=3
             )
             orchestrator = BlindOrchestrator(config=config)
@@ -364,8 +435,10 @@ class LangGraphRunner:
 
         try:
             # Initialize orchestrator
+            api_base = self._get_api_base()
             config = OrchestratorConfig(
-                llm_model="gpt-4o",
+                llm_model=self._get_litellm_model(),
+                api_base=api_base,
                 max_retries=3
             )
             orchestrator = BlindOrchestrator(config=config)
@@ -607,7 +680,7 @@ class LangGraphRunner:
             sandbox._initialized = True
 
             # Initialize engineer for E2E
-            config = EngineerConfig(llm_model="gpt-4o")
+            config = EngineerConfig(llm_model=self._get_litellm_model())
 
             # Create project state for engineer
             project_state = ProjectState(
@@ -756,11 +829,12 @@ class LangGraphRunner:
             "demotion_target": None
         }
 
-        # Create config with thread ID for checkpointing
+        # Create config with thread ID for checkpointing and higher recursion limit
         self.config = {
             "configurable": {
                 "thread_id": project_id
-            }
+            },
+            "recursion_limit": 50  # Increased from default 25 to handle retries
         }
 
         # Run the graph

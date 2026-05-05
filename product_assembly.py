@@ -396,7 +396,7 @@ async function fetchAPI(method, endpoint, data = null) {
         if (response.status === 401) {
             // Unauthorized - clear token and redirect to login
             localStorage.removeItem('auth_token');
-            window.location.href = '/pages/login.html';
+            window.location.href = 'login.html';
             return null;
         }
 
@@ -476,7 +476,7 @@ function initializeNav() {
 
     // Add home link (points to index, not a hardcoded dashboard)
     const homeLink = document.createElement('a');
-    homeLink.href = '/index.html';
+    homeLink.href = '../index.html';
     homeLink.textContent = 'Home';
     nav.appendChild(homeLink);
 
@@ -507,12 +507,12 @@ function initializeNav() {
         logoutBtn.onclick = (e) => {
             e.preventDefault();
             clearAuthToken();
-            window.location.href = '/pages/login.html';
+            window.location.href = 'login.html';
         };
         nav.appendChild(logoutBtn);
     } else {
         const loginLink = document.createElement('a');
-        loginLink.href = '/pages/login.html';
+        loginLink.href = 'login.html';
         loginLink.textContent = 'Login';
         nav.appendChild(loginLink);
     }

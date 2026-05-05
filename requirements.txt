@@ -8,8 +8,5 @@ litellm>=1.0.0
 langgraph>=1.0.0
 langchain-core>=0.1.0
 
-# UI
-streamlit>=1.57.0
-
 # Environment management
 python-dotenv>=1.0.0

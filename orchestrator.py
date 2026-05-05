@@ -258,8 +258,22 @@ Check for:
 
     def _setup_client(self) -> None:
         """Initialize the instructor-enhanced LLM client."""
-        api_key = self.config.api_key or os.getenv("OPENAI_API_KEY")
-        self.api_key = api_key  # Store locally instead of global mutation
+        model = self.config.llm_model
+
+        # Determine api_key and api_base from model prefix or config
+        if model.startswith("openrouter/"):
+            self.api_key = self.config.api_key or os.getenv("OPENROUTER_API_KEY")
+            self.api_base = None  # LiteLLM handles openrouter/ routing natively
+        elif self.config.api_base:
+            # Custom OpenAI-compatible provider (e.g. Inception)
+            self.api_key = self.config.api_key or os.getenv("INCEPTION_API_KEY") or os.getenv("OPENAI_API_KEY")
+            self.api_base = self.config.api_base
+        elif model.startswith("ollama/"):
+            self.api_key = None
+            self.api_base = "http://localhost:11434"
+        else:
+            self.api_key = self.config.api_key or os.getenv("OPENAI_API_KEY")
+            self.api_base = None
 
         self.client = instructor.from_litellm(
             litellm.completion,
@@ -545,7 +559,7 @@ Check for:
             sys_prompt = self.STORIES_CRITIC_SYS
         
         try:
-            response = self.client.chat.completions.create(
+            kwargs = dict(
                 model=self.config.llm_model,
                 messages=[
                     {"role": "system", "content": sys_prompt},
@@ -555,6 +569,11 @@ Check for:
                 max_tokens=500,
                 temperature=0.3
             )
+            if self.api_key:
+                kwargs["api_key"] = self.api_key
+            if self.api_base:
+                kwargs["api_base"] = self.api_base
+            response = self.client.chat.completions.create(**kwargs)
             return response
         except Exception as e:
             print(f"Self-critique failed: {e}")
@@ -600,7 +619,7 @@ Check for:
 
         # CRITICAL: NEW session - no prior messages
         # This ensures unbiased critique
-        response = self.client.chat.completions.create(
+        kwargs = dict(
             model=self.config.llm_model,
             messages=[
                 {"role": "system", "content": sys_prompt},
@@ -610,7 +629,12 @@ Check for:
             max_tokens=500,
             temperature=0.3
         )
-        
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        response = self.client.chat.completions.create(**kwargs)
+
         return response
 
     def _regenerate_draft(

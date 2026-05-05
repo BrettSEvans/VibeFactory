@@ -572,8 +572,8 @@ Return valid JSON with pages, components, styles, and navigation_update keys."""
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{page.title}</title>
-    <link rel="stylesheet" href="/styles.css">
-    <link rel="stylesheet" href="/pages/{page.name}.css">
+    <link rel="stylesheet" href="../styles.css">
+    <link rel="stylesheet" href="{page.name}.css">
 </head>
 <body>
     <nav id="navbar"></nav>
@@ -596,9 +596,9 @@ Return valid JSON with pages, components, styles, and navigation_update keys."""
         </div>
     </main>
 
-    <script src="/api.js"></script>
-    <script src="/nav.js"></script>
-    <script src="/pages/{page.name}.js"></script>
+    <script src="../api.js"></script>
+    <script src="../nav.js"></script>
+    <script src="{page.name}.js"></script>
     <script>
         // Initialize page when DOM is ready
         document.addEventListener('DOMContentLoaded', init{page.name}Page);
