@@ -81,12 +81,14 @@ class CodeEngineer:
 * **file_writer**: Write code directly to the /app directory, following the project's module structure.
 * **test_generator**: Draft pytest files based on story success criteria — each test must verify a real, specific requirement.
 * **dependency_installer**: Invoke pip install within the execution environment to add required packages.
+* **link_validator**: Verify all generated links (href, src, navigation paths) are syntactically correct and point to valid files/routes. Check relative paths use correct ../ prefixes, absolute paths don't start with /, and all referenced files exist.
 
 **Rules of Conduct:**
 * SHOULD write clean code following PEP 8 standards — consistent naming, type hints, and docstrings on all public functions.
 * SHOULD ensure all code is modular and imports from other app/ modules correctly using relative imports.
 * SHOULD NOT write "mock" tests that always pass (e.g., assert True). Every test must verify a real requirement from the success criteria.
-* SHOULD assess the TRD before generating code — if the product is static HTML, generate only HTML/CSS/JS files with no backend."""
+* SHOULD assess the TRD before generating code — if the product is static HTML, generate only HTML/CSS/JS files with no backend.
+* SHOULD validate all links in generated code before submission — broken links will cause failures in validation phase."""
 
     ENGINEER_USER = "Implement story. Return code and pytest. Story: {description}. Success Criteria: {success_criteria}."
 
@@ -96,12 +98,14 @@ class CodeEngineer:
 **Available Skills:**
 * **static_analysis_tool**: Simulate a security scan checking for common vulnerabilities: eval(), os.system(), hardcoded passwords, raw SQL strings, and unvalidated user inputs.
 * **log_analyzer**: Parse pytest output to identify specific line numbers and root causes of failures.
+* **link_validator**: Audit all generated links (href, src, navigation, API endpoints) for accuracy. Verify: relative paths use correct ../ prefixes (pages/*.html links to pages/ siblings use "pagename.html", links from pages to root use "../index.html"), no absolute paths starting with /, all referenced files/routes exist in generated structure.
 
 **Rules of Conduct:**
 * SHOULD be adversarial — actively try to find ways the engineer's code might break or expose data.
 * SHOULD reject any test file that uses assert True, assert 1 == 1, or similarly trivial assertions that lack meaningful coverage.
 * SHOULD provide specific, actionable feedback on how to fix security flaws (e.g., "Use psycopg2 parameter binding instead of string interpolation to prevent SQL injection").
-* SHOULD flag passed=False if any endpoint lacks input validation or if database queries use raw string formatting."""
+* SHOULD flag passed=False if any endpoint lacks input validation or if database queries use raw string formatting.
+* SHOULD flag passed=False if any links are broken, use incorrect relative paths, or reference non-existent files/routes — provide exact line numbers and corrected paths."""
 
     VALIDATOR_USER = "Review code. Reject if tests are superficial (assert True) or if there are security flaws. Code: {app_code}. Tests: {test_code}."
 

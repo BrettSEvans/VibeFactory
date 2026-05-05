@@ -11,6 +11,7 @@ Performs independent security and quality review of generated code before execut
 - **Code Quality Check**: Assesses code cleanliness and maintainability
 - **Dependency Validation**: Verifies that code uses approved/safe dependencies
 - **Surface Area Analysis**: Identifies risky code patterns or potential failure modes
+- **Link Validation**: Audits all generated links (href, src, navigation, API endpoints) for accuracy. Verifies relative paths use correct ../ prefixes, no absolute paths starting with /, and all referenced files/routes exist in the generated structure
 
 ## Input Specification
 
@@ -36,6 +37,7 @@ Performs independent security and quality review of generated code before execut
   - Superficial tests (assert True, empty test bodies)
   - Missing error handling for stated risks
   - Code complexity or maintainability concerns
+  - Broken links, incorrect relative path prefixes, references to non-existent files/routes
 
 ## Quality Metrics
 
