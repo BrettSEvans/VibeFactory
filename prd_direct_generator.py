@@ -136,6 +136,9 @@ async def client():
 
 _IMPLEMENTATION_SYSTEM = """You are a Senior FastAPI Developer implementing code to pass a given pytest test suite.
 
+OUTPUT INSTRUCTION: Return ONLY valid JSON with these 4 keys: models_py, routes_py, main_py, requirements_txt.
+Do NOT use multiple tool calls. Return a single JSON object.
+
 RULES:
 - Write real, working code — no stubs, no mocks, no pass statements
 - Use SQLAlchemy ORM with SQLite (no raw SQL)
@@ -171,7 +174,9 @@ def get_db():
         yield db
     finally:
         db.close()
-```"""
+```
+
+Return valid JSON only: {"models_py": "...", "routes_py": "...", "main_py": "...", "requirements_txt": "..."}"""
 
 _IMPLEMENTATION_USER_TEMPLATE = """Implement a FastAPI application that makes ALL of the following tests pass.
 
@@ -338,6 +343,34 @@ class PRDDirectGenerator:
                     **self._llm_kwargs(),
                 )
             except Exception as e:
+                error_str = str(e).lower()
+                # If it's a tool call issue, try fallback plain JSON approach
+                if "multiple tool calls" in error_str or "tool call" in error_str:
+                    logger.warning(f"Tool call error in attempt {attempt + 1}. Trying plain JSON fallback...")
+                    try:
+                        completion = litellm.completion(
+                            model=self.config.llm_model,
+                            messages=[
+                                {"role": "system", "content": "Return ONLY valid JSON with keys: models_py, routes_py, main_py, requirements_txt. No markdown, no explanation."},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            timeout=150,
+                            **self._llm_kwargs(),
+                        )
+                        import json
+                        json_str = completion.choices[0].message.content.strip()
+                        if json_str.startswith("```json"):
+                            json_str = json_str[7:]
+                        if json_str.startswith("```"):
+                            json_str = json_str[3:]
+                        if json_str.endswith("```"):
+                            json_str = json_str[:-3]
+                        json_str = json_str.strip()
+                        data = json.loads(json_str)
+                        return GeneratedImplementation(**data)
+                    except Exception as fallback_e:
+                        logger.warning(f"Fallback parsing failed: {fallback_e}. Will retry main path...")
+
                 if attempt < self.config.max_retries - 1:
                     time.sleep(20)
                     logger.warning(f"Implementation generation attempt {attempt + 1} failed: {e}")
