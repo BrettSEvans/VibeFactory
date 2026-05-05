@@ -380,24 +380,120 @@ class PRDDirectGenerator:
 
     def _generate_frontend(self, prd_content: str) -> Dict[str, str]:
         """Step 4: Generate frontend directly from PRD (reuse FrontendGenerator)."""
-        from frontend_generator import FrontendGenerator, FrontendGeneratorConfig
+        from frontend_generator import FrontendGenerator, FrontendGeneratorConfig, GeneratedFrontendCode
+
+        logger.info("Frontend generation starting...")
         fg_config = FrontendGeneratorConfig(
             llm_model=self.config.llm_model,
             api_key=self.config.api_key,
             api_base=self.config.api_base,
         )
         fg = FrontendGenerator(config=fg_config)
-        result = fg.generate_from_prd(prd_content)
 
-        # Flatten into a single dict: {relative_path: content}
-        files: Dict[str, str] = {}
-        for filename, content in result.pages.items():
-            files[filename] = content
-        for filename, content in result.components.items():
-            files[f"js/{filename}"] = content
-        for filename, content in result.styles.items():
-            files[filename] = content
-        return files
+        try:
+            result = fg.generate_from_prd(prd_content)
+            logger.info(f"Frontend generated: {len(result.pages)} pages, {len(result.components)} components, {len(result.styles)} styles")
+
+            # Check if result is the minimal fallback template
+            index_html = result.pages.get("index.html", "")
+            is_fallback = "Application frontend loaded successfully" in index_html
+
+            if is_fallback or not result.pages or not result.components:
+                logger.warning(f"Frontend generation returned fallback content (is_fallback={is_fallback}) - trying manual LLM call...")
+                # The FrontendGenerator fell back, try a direct LLM call with simplified prompt
+                for retry in range(2):
+                    try:
+                        # Simplified system prompt focused on generating actual product content
+                        prd_frontend_system = """You are a Senior Frontend Developer generating a complete HTML frontend from a PRD document.
+Your task: Create a real, functional website with actual product information extracted from the PRD.
+
+CRITICAL: You MUST include actual product/service names, features, and descriptions from the PRD in the generated HTML.
+
+Return ONLY valid JSON (no markdown wrapping, no explanations):
+{"pages":{"index.html":"<full html>"},"components":{},"styles":{},"navigation_update":""}
+
+The HTML must:
+- Include actual product/service names from PRD
+- Include actual features and benefits from PRD
+- Have real call-to-action buttons for the actual product
+- Use inline CSS (no external files)
+- Be production-ready and semantic HTML5"""
+
+                        completion = litellm.completion(
+                            model=self.config.llm_model,
+                            messages=[
+                                {"role": "system", "content": prd_frontend_system},
+                                {"role": "user", "content": f"Generate a complete frontend from this PRD. Include actual product names, features, and descriptions:\n\n{prd_content[:4000]}"},
+                            ],
+                            timeout=120,
+                            **self._llm_kwargs(),
+                        )
+                        import json
+                        response_text = completion.choices[0].message.content.strip()
+
+                        # Try to extract JSON from response
+                        json_str = response_text
+                        if "```" in json_str:
+                            # Remove markdown code blocks
+                            json_str = json_str.split("```")[1]
+                            if json_str.startswith("json"):
+                                json_str = json_str[4:].strip()
+                            else:
+                                json_str = json_str.lstrip()
+
+                        json_str = json_str.rstrip("`").strip()
+
+                        # Parse and validate
+                        data = json.loads(json_str)
+                        pages = data.get("pages", {})
+
+                        # Check if we got actual product content (should have more than just boilerplate)
+                        index_html = pages.get("index.html", "")
+                        has_real_content = (
+                            len(index_html) > 500 and
+                            "Application frontend loaded successfully" not in index_html
+                        )
+
+                        if has_real_content:
+                            result = GeneratedFrontendCode(
+                                pages=pages,
+                                components=data.get("components", {}),
+                                styles=data.get("styles", {}),
+                                navigation_update=data.get("navigation_update", "")
+                            )
+                            logger.info(f"Manual LLM fallback succeeded on attempt {retry + 1} with {len(index_html)} chars")
+                            break
+                        else:
+                            logger.warning(f"Manual LLM attempt {retry + 1}: returned placeholder/minimal content ({len(index_html)} chars), retrying...")
+                            if retry < 1:
+                                time.sleep(10)
+                    except Exception as e:
+                        logger.warning(f"Manual LLM attempt {retry + 1} failed: {e}")
+                        if retry < 1:
+                            time.sleep(10)
+                        else:
+                            logger.warning(f"Manual LLM fallback exhausted. Proceeding with minimal fallback.")
+
+            # Flatten into a single dict: {relative_path: content}
+            files: Dict[str, str] = {}
+            for filename, content in result.pages.items():
+                if content and content.strip():  # Only add non-empty files
+                    files[filename] = content
+                    logger.debug(f"  Page: {filename} ({len(content)} chars)")
+            for filename, content in result.components.items():
+                if content and content.strip():
+                    files[f"js/{filename}"] = content
+                    logger.debug(f"  Component: {filename} ({len(content)} chars)")
+            for filename, content in result.styles.items():
+                if content and content.strip():
+                    files[filename] = content
+                    logger.debug(f"  Style: {filename} ({len(content)} chars)")
+
+            logger.info(f"Frontend flattened to {len(files)} files")
+            return files
+        except Exception as e:
+            logger.error(f"Frontend generation failed: {e}", exc_info=True)
+            raise
 
     async def generate(
         self,
