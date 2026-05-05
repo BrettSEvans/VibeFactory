@@ -165,12 +165,33 @@ CRITICAL CONSTRAINTS:
 - You MUST NOT reference backend technologies (FastAPI, SQLAlchemy, database schemas, etc.)
 - You MUST NOT include authentication UI elements unless explicitly mentioned in PRD vision/features
 
+FILE STRUCTURE — follow exactly, all paths must match this layout:
+  frontend/
+    index.html          ← landing page (root level)
+    styles.css          ← shared stylesheet
+    api.js              ← shared API helper
+    nav.js              ← shared navigation (auto-loaded, do NOT include in components)
+    pages/
+      catalog.html      ← each additional page lives here
+      detail.html
+      login.html
+      ...
+
+LINK AND PATH RULES — violations cause 404 errors, follow precisely:
+- In index.html: link to other pages as   href="pages/pagename.html"
+- In pages/*.html: link to other pages as href="pagename.html"  (same directory, NO pages/ prefix)
+- In pages/*.html: link back to home as   href="../index.html"
+- CTA buttons ("View Details", "Learn More", etc.) must use the SAME rules above
+- NEVER use absolute paths starting with /
+- NEVER use paths like /pages/foo.html or /foo.html
+- CSS: pages use  href="../styles.css"   index uses  href="styles.css"
+- JS:  pages use  src="../js/api.js"     index uses  src="js/api.js"
+
 FRONTEND GENERATION RULES:
-- Generate a complete, single-page application with proper navigation
+- Generate a complete multi-page application with working navigation
 - Create semantic HTML5 with accessibility support (WCAG 2.1)
 - Use responsive CSS Grid/Flexbox for all layouts
 - Write vanilla JavaScript (no frameworks) with proper error handling
-- Generate multiple interconnected pages with working navigation
 - Include proper form validation and user feedback
 - Support dark/light mode with CSS custom properties
 - All code must be production-ready with no TODOs or placeholders
@@ -596,8 +617,8 @@ Return valid JSON with pages, components, styles, and navigation_update keys."""
         </div>
     </main>
 
-    <script src="../api.js"></script>
-    <script src="../nav.js"></script>
+    <script src="../js/api.js"></script>
+    <script src="../js/nav.js"></script>
     <script src="{page.name}.js"></script>
     <script>
         // Initialize page when DOM is ready

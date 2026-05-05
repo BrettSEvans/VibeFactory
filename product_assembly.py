@@ -465,30 +465,45 @@ function registerPage(title, path, requiresAuth = false) {
 /**
  * Initialize navigation bar
  */
+/**
+ * Resolve a page path relative to the current page location.
+ * Pages live in /frontend/pages/. index.html lives in /frontend/.
+ * A stored path like "pages/catalog.html" must become "catalog.html"
+ * when the link is rendered from inside /pages/.
+ */
+function resolvePath(path) {
+    const inPages = window.location.pathname.includes('/pages/');
+    if (inPages && path.startsWith('pages/')) {
+        return path.slice('pages/'.length);
+    }
+    return path;
+}
+
 function initializeNav() {
     const navbar = document.getElementById('navbar');
     if (!navbar) return;
+
+    const inPages = window.location.pathname.includes('/pages/');
 
     const nav = document.createElement('nav');
     nav.style.display = 'flex';
     nav.style.gap = '1rem';
     nav.style.alignItems = 'center';
 
-    // Add home link (points to index, not a hardcoded dashboard)
+    // Home link — one level up when inside /pages/, same dir at root
     const homeLink = document.createElement('a');
-    homeLink.href = '../index.html';
+    homeLink.href = inPages ? '../index.html' : 'index.html';
     homeLink.textContent = 'Home';
     nav.appendChild(homeLink);
 
-    // Add page links
+    // Add page links with location-aware path resolution
     PAGES.forEach(page => {
-        // Skip pages that require auth if not authenticated
         if (page.requiresAuth && !isAuthenticated()) {
             return;
         }
 
         const link = document.createElement('a');
-        link.href = page.path;
+        link.href = resolvePath(page.path);
         link.textContent = page.title;
         nav.appendChild(link);
     });
@@ -498,7 +513,8 @@ function initializeNav() {
     spacer.style.marginLeft = 'auto';
     nav.appendChild(spacer);
 
-    // Add auth links
+    // Auth links — resolve login path the same way
+    const loginPath = resolvePath('pages/login.html');
     if (isAuthenticated()) {
         const logoutBtn = document.createElement('a');
         logoutBtn.href = '#';
@@ -507,12 +523,12 @@ function initializeNav() {
         logoutBtn.onclick = (e) => {
             e.preventDefault();
             clearAuthToken();
-            window.location.href = 'login.html';
+            window.location.href = loginPath;
         };
         nav.appendChild(logoutBtn);
     } else {
         const loginLink = document.createElement('a');
-        loginLink.href = 'login.html';
+        loginLink.href = loginPath;
         loginLink.textContent = 'Login';
         nav.appendChild(loginLink);
     }
