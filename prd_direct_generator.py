@@ -35,6 +35,7 @@ class APIEndpointSpec(BaseModel):
 
 
 class PRDFeatureSet(BaseModel):
+    """Structured feature set extracted from PRD by LLM."""
     product_type: str = Field(
         ...,
         description="'fullstack' if an API/database is needed, 'frontend_only' if purely static UI"
@@ -49,6 +50,10 @@ class PRDFeatureSet(BaseModel):
         description="REST API endpoints needed to support the PRD features"
     )
     frontend_pages: List[str] = Field(..., description="Names of frontend pages or views")
+
+    class Config:
+        # Allow LLM to use alternative names (e.g., PRDFFeatureSet, FeatureSet, etc.)
+        populate_by_name = True
 
 
 class GeneratedTests(BaseModel):
@@ -66,10 +71,22 @@ class GeneratedImplementation(BaseModel):
 # ── System prompts ─────────────────────────────────────────────────────────────
 
 _FEATURE_EXTRACTION_SYSTEM = """You are a Senior Software Architect.
-Read the PRD and extract structured product requirements. Be conservative — only extract
-what is explicitly required by the PRD. Determine whether the product needs a backend
-(database + REST API) or is purely a frontend/static site. Identify all data entities,
-API endpoints, and frontend pages needed."""
+Read the PRD and extract structured product requirements into the exact JSON format specified below.
+Be conservative — only extract what is explicitly required by the PRD.
+Determine whether the product needs a backend (database + REST API) or is purely a frontend/static site.
+Identify all data entities, API endpoints, and frontend pages needed.
+
+Return a JSON object with these exact fields:
+{
+  "product_type": "fullstack" or "frontend_only",
+  "features": ["list", "of", "feature", "names"],
+  "backend_entities": ["entity", "names"],
+  "api_endpoints": [
+    {"method": "GET", "path": "/endpoint", "purpose": "description"},
+    ...
+  ],
+  "frontend_pages": ["page", "names"]
+}"""
 
 _TEST_GENERATION_SYSTEM = """You are a Senior QA Engineer writing pytest tests in Test-Driven Development style.
 You are given a PRD and a structured feature set. You must write tests BEFORE any implementation exists.
@@ -221,6 +238,36 @@ class PRDDirectGenerator:
                     **self._llm_kwargs(),
                 )
             except Exception as e:
+                error_str = str(e).lower()
+                # If it's a tool name mismatch, try a simpler approach
+                if "tool name does not match" in error_str or "function" in error_str:
+                    logger.warning(f"Tool name mismatch in attempt {attempt + 1}. Retrying with fallback prompt...")
+                    try:
+                        # Try without structured output — parse the response manually
+                        completion = litellm.completion(
+                            model=self.config.llm_model,
+                            messages=[
+                                {"role": "system", "content": "Extract product features from the PRD and return ONLY valid JSON (no markdown, no explanation). Return the JSON object directly."},
+                                {"role": "user", "content": f"Extract the product feature set from this PRD as JSON:\n\n{prd_content[:4000]}"},
+                            ],
+                            timeout=90,
+                            **self._llm_kwargs(),
+                        )
+                        import json
+                        json_str = completion.choices[0].message.content.strip()
+                        # Remove markdown code block if present
+                        if json_str.startswith("```json"):
+                            json_str = json_str[7:]
+                        if json_str.startswith("```"):
+                            json_str = json_str[3:]
+                        if json_str.endswith("```"):
+                            json_str = json_str[:-3]
+                        json_str = json_str.strip()
+                        data = json.loads(json_str)
+                        return PRDFeatureSet(**data)
+                    except Exception as fallback_e:
+                        logger.warning(f"Fallback parsing failed: {fallback_e}. Will retry main path...")
+
                 if attempt < self.config.max_retries - 1:
                     time.sleep(15)
                     logger.warning(f"Feature extraction attempt {attempt + 1} failed: {e}")
