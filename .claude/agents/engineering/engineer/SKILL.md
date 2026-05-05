@@ -11,6 +11,7 @@ Generates production-quality Python code and comprehensive pytest test suites ba
 - **Code Organization**: Structures code with appropriate modules, classes, and functions
 - **Documentation**: Includes docstrings and comments where behavior is non-obvious
 - **Feedback Integration**: Regenerates code based on validator feedback and test failures
+- **Link Validation**: Verifies all generated links (href, src, navigation paths) are syntactically correct and point to valid files/routes. Checks relative paths use correct ../ prefixes, absolute paths don't start with /, and all referenced files exist
 
 ## Input Specification
 

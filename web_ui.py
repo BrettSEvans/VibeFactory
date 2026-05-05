@@ -42,6 +42,7 @@ class GenerationRequest(BaseModel):
     project_id: Optional[str] = None  # User-provided project ID (optional, will generate if not provided)
     rough_idea: str
     skip_documents: bool = False  # Skip BRD/PRD/TRD if True
+    use_legacy_workflow: bool = False  # False = PRD-Direct TDD (default); True = TRD → Stories → Code
     llm_provider: str = "openrouter"  # "ollama", "openrouter", or "inception"
     llm_model: Optional[str] = None  # Specific model within provider
 
@@ -636,6 +637,26 @@ async def serve_ui():
                 </div>
 
                 <div class="form-group">
+                    <label>Workflow Mode</label>
+                    <div style="display:flex; gap:24px; flex-wrap:wrap; margin-top:4px;">
+                        <label style="display:flex; align-items:flex-start; gap:8px; font-weight:400; cursor:pointer;">
+                            <input type="radio" name="workflowMode" id="modePrdDirect" value="prd_direct" checked style="margin-top:3px;">
+                            <span>
+                                <strong>PRD-Direct (TDD)</strong> — default<br>
+                                <small style="color:#888;">BRD → PRD → generate tests → generate code. Faster, fewer approval gates.</small>
+                            </span>
+                        </label>
+                        <label style="display:flex; align-items:flex-start; gap:8px; font-weight:400; cursor:pointer;">
+                            <input type="radio" name="workflowMode" id="modeLegacy" value="legacy" style="margin-top:3px;">
+                            <span>
+                                <strong>Advanced Workflow (TRD + Stories)</strong><br>
+                                <small style="color:#888;">BRD → PRD → TRD → Stories → code. More control, more approval gates.</small>
+                            </span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="form-group">
                     <label for="roughIdea">Your Idea</label>
                     <textarea
                         id="roughIdea"
@@ -903,6 +924,13 @@ async def serve_ui():
             }
             // ────────────────────────────────────────────────────────────────────
 
+            function updateStageLabels() {
+                const isLegacy = document.getElementById('modeLegacy').checked;
+                const labels = ['BRD', 'PRD', isLegacy ? 'TRD' : 'Tests', isLegacy ? 'Stories' : 'Implement', 'Code', 'Complete'];
+                document.querySelectorAll('.stage-label').forEach((el, i) => { if (labels[i] !== undefined) el.textContent = labels[i]; });
+            }
+            document.querySelectorAll('input[name="workflowMode"]').forEach(r => r.addEventListener('change', updateStageLabels));
+
             form.addEventListener('submit', async (e) => {
                 e.preventDefault();
 
@@ -910,6 +938,7 @@ async def serve_ui():
                 currentProjectId = projectId;  // needed by HITL approveDocument()
                 const roughIdea = document.getElementById('roughIdea').value;
                 const skipDocs = document.getElementById('skipDocs').checked;
+                const useLegacyWorkflow = document.querySelector('input[name="workflowMode"]:checked').value === 'legacy';
 
                 if (!projectId || !roughIdea) {
                     alert('Please fill in all fields');
@@ -995,6 +1024,7 @@ async def serve_ui():
                             project_id: projectId,
                             rough_idea: roughIdea,
                             skip_documents: skipDocs,
+                            use_legacy_workflow: useLegacyWorkflow,
                             llm_provider: selectedProvider,
                             llm_model: selectedModel || null
                         })
@@ -1190,6 +1220,7 @@ async def _run_generation_task(
     llm_model: str,
     llm_api_key: Optional[str],
     skip_documents: bool = False,
+    use_legacy_workflow: bool = False,
     llm_api_base: Optional[str] = None,
 ):
     """
@@ -1246,58 +1277,90 @@ async def _run_generation_task(
                 prd_doc.content = approved_prd
                 prd_doc.status = "approved"
 
-            # TRD
-            await update_progress(project_id, "TRD", 35,
-                "🏗️ Writing Technical Requirements Document...", "in_progress")
-            await asyncio.sleep(0)
-            await loop.run_in_executor(
-                None, lambda: orchestrator.orchestrate_phase(Phase.TRD)
-            )
-            # HITL: pause for TRD review
-            trd_doc = project_state.docs.get("TRD")
-            if trd_doc and trd_doc.content:
-                approved_trd = await wait_for_human_approval(project_id, "TRD", trd_doc.content, 42)
-                trd_doc.content = approved_trd
-                trd_doc.status = "approved"
+            if not use_legacy_workflow:
+                # ── PRD-Direct TDD: generate code directly from PRD ──────────────
+                docs_dir = Path(f"./products/{project_id}/docs")
+                docs_dir.mkdir(parents=True, exist_ok=True)
+                for doc_type in ["BRD", "PRD"]:
+                    doc = project_state.docs.get(doc_type)
+                    if doc and doc.content:
+                        (docs_dir / f"{doc_type}.md").write_text(doc.content)
+                        context_docs[doc_type] = doc.content
+                        logger.info(f"Saved {doc_type} ({len(doc.content)} chars)")
 
-            # Stories
-            await update_progress(project_id, "Stories", 50,
-                "📖 Breaking down User Stories...", "in_progress")
-            await asyncio.sleep(0)
-            await loop.run_in_executor(
-                None, lambda: orchestrator.orchestrate_phase(Phase.STORIES)
-            )
-            # HITL: pause for STORIES review
-            stories_hitl_doc = project_state.docs.get("STORIES")
-            if stories_hitl_doc and stories_hitl_doc.content:
-                approved_stories = await wait_for_human_approval(
-                    project_id, "STORIES", stories_hitl_doc.content, 55
+                prd_content = context_docs.get("PRD", "")
+                from prd_direct_generator import PRDDirectGenerator, PRDDirectConfig
+                prd_config = PRDDirectConfig(
+                    llm_model=llm_model,
+                    api_key=llm_api_key,
+                    api_base=llm_api_base,
                 )
-                stories_hitl_doc.content = approved_stories
-                stories_hitl_doc.status = "approved"
+                prd_gen = PRDDirectGenerator(config=prd_config)
 
-            # Save docs to disk inside the product directory
-            docs_dir = Path(f"./products/{project_id}/docs")
-            docs_dir.mkdir(parents=True, exist_ok=True)
-            for doc_type in ["BRD", "PRD", "TRD", "STORIES"]:
-                doc = project_state.docs.get(doc_type)
-                if doc and doc.content:
-                    # All documents are now markdown format
-                    ext = ".md"
-                    (docs_dir / f"{doc_type}{ext}").write_text(doc.content)
-                    context_docs[doc_type] = doc.content
-                    logger.info(f"Saved {doc_type} ({len(doc.content)} chars)")
+                async def _prd_progress(step: str, pct: int, msg: str):
+                    await update_progress(project_id, step, pct, msg, "in_progress")
 
-            # Parse stories from the STORIES document (markdown format)
-            stories_doc = project_state.docs.get("STORIES")
-            if stories_doc and stories_doc.content:
-                try:
-                    # Parse markdown format stories
-                    stories = stories_from_markdown(stories_doc.content)
-                    logger.info(f"✓ Parsed {len(stories)} stories from STORIES doc")
-                except Exception as e:
-                    logger.warning(f"⚠ Could not parse STORIES markdown ({type(e).__name__}: {str(e)[:100]}); using single-story fallback")
-                    stories = None
+                product_path = await prd_gen.generate(
+                    project_id=project_id,
+                    prd_content=prd_content,
+                    context_docs=context_docs,
+                    progress_cb=_prd_progress,
+                )
+                await update_progress(project_id, "Complete", 100,
+                    "✅ Product generation complete!", "completed",
+                    extra={"product_path": product_path})
+                return
+            else:
+                # ── Legacy: TRD → Stories → Code ─────────────────────────────────
+                # TRD
+                await update_progress(project_id, "TRD", 35,
+                    "🏗️ Writing Technical Requirements Document...", "in_progress")
+                await asyncio.sleep(0)
+                await loop.run_in_executor(
+                    None, lambda: orchestrator.orchestrate_phase(Phase.TRD)
+                )
+                # HITL: pause for TRD review
+                trd_doc = project_state.docs.get("TRD")
+                if trd_doc and trd_doc.content:
+                    approved_trd = await wait_for_human_approval(project_id, "TRD", trd_doc.content, 42)
+                    trd_doc.content = approved_trd
+                    trd_doc.status = "approved"
+
+                # Stories
+                await update_progress(project_id, "Stories", 50,
+                    "📖 Breaking down User Stories...", "in_progress")
+                await asyncio.sleep(0)
+                await loop.run_in_executor(
+                    None, lambda: orchestrator.orchestrate_phase(Phase.STORIES)
+                )
+                # HITL: pause for STORIES review
+                stories_hitl_doc = project_state.docs.get("STORIES")
+                if stories_hitl_doc and stories_hitl_doc.content:
+                    approved_stories = await wait_for_human_approval(
+                        project_id, "STORIES", stories_hitl_doc.content, 55
+                    )
+                    stories_hitl_doc.content = approved_stories
+                    stories_hitl_doc.status = "approved"
+
+                # Save docs to disk inside the product directory
+                docs_dir = Path(f"./products/{project_id}/docs")
+                docs_dir.mkdir(parents=True, exist_ok=True)
+                for doc_type in ["BRD", "PRD", "TRD", "STORIES"]:
+                    doc = project_state.docs.get(doc_type)
+                    if doc and doc.content:
+                        (docs_dir / f"{doc_type}.md").write_text(doc.content)
+                        context_docs[doc_type] = doc.content
+                        logger.info(f"Saved {doc_type} ({len(doc.content)} chars)")
+
+                # Parse stories from the STORIES document (markdown format)
+                stories_doc = project_state.docs.get("STORIES")
+                if stories_doc and stories_doc.content:
+                    try:
+                        stories = stories_from_markdown(stories_doc.content)
+                        logger.info(f"✓ Parsed {len(stories)} stories from STORIES doc")
+                    except Exception as e:
+                        logger.warning(f"⚠ Could not parse STORIES markdown ({type(e).__name__}: {str(e)[:100]}); using single-story fallback")
+                        stories = None
 
         # ── Fallback: single story if docs skipped or STORIES parse failed ──
         if not stories:
@@ -1402,7 +1465,12 @@ async def generate_product(request: GenerationRequest):
 
     logger.info(f"Using LLM: {llm_model} (provider: {request.llm_provider})")
 
-    mode = "skipping docs" if request.skip_documents else "BRD → PRD → TRD → Stories → Code"
+    if request.skip_documents:
+        mode = "skipping docs"
+    elif request.use_legacy_workflow:
+        mode = "BRD → PRD → TRD → Stories → Code"
+    else:
+        mode = "BRD → PRD → TDD Code"
     await update_progress(project_id, "Initializing", 2,
                            f"Starting ({mode}) with {llm_model}...", "in_progress")
 
@@ -1410,6 +1478,7 @@ async def generate_product(request: GenerationRequest):
     asyncio.create_task(_run_generation_task(
         project_id, request.rough_idea, llm_model, llm_api_key,
         skip_documents=request.skip_documents,
+        use_legacy_workflow=request.use_legacy_workflow,
         llm_api_base=llm_api_base,
     ))
 
