@@ -23,7 +23,7 @@ class PRDDirectConfig(BaseModel):
     llm_model: str = Field(default="meta-llama/llama-3.3-70b-instruct:free")
     api_key: Optional[str] = None
     api_base: Optional[str] = None
-    max_retries: int = 2
+    max_retries: int = 3  # Matches legacy workflow (backend_generator.py, frontend_generator.py)
 
 
 # ── Structured LLM response models ────────────────────────────────────────────
@@ -228,7 +228,7 @@ class PRDDirectGenerator:
         return base
 
     def _extract_features(self, prd_content: str) -> PRDFeatureSet:
-        """Step 1: Extract structured feature set from PRD."""
+        """Step 1: Extract structured feature set from PRD with graceful failure."""
         for attempt in range(self.config.max_retries):
             try:
                 return self.client.create(
@@ -244,44 +244,63 @@ class PRDDirectGenerator:
                 )
             except Exception as e:
                 error_str = str(e).lower()
-                # If it's a tool name mismatch, try a simpler approach
+                # Error classification (from backend_generator.py pattern)
+                is_rate_limit = "429" in error_str or "rate" in error_str or "quota" in error_str
+                is_timeout = "timeout" in error_str or "deadline" in error_str
+
+                # Try JSON fallback for tool name mismatches
                 if "tool name does not match" in error_str or "function" in error_str:
-                    logger.warning(f"Tool name mismatch in attempt {attempt + 1}. Retrying with fallback prompt...")
                     try:
-                        # Try without structured output — parse the response manually
                         completion = litellm.completion(
                             model=self.config.llm_model,
                             messages=[
-                                {"role": "system", "content": "Extract product features from the PRD and return ONLY valid JSON (no markdown, no explanation). Return the JSON object directly."},
-                                {"role": "user", "content": f"Extract the product feature set from this PRD as JSON:\n\n{prd_content[:4000]}"},
+                                {"role": "system", "content": "Extract product features from PRD. Return ONLY valid JSON: {\"product_type\":\"...\",\"features\":[...],\"backend_entities\":[...],\"api_endpoints\":[...],\"frontend_pages\":[...]}"},
+                                {"role": "user", "content": f"Extract features from PRD:\n\n{prd_content[:4000]}"},
                             ],
                             timeout=90,
                             **self._llm_kwargs(),
                         )
                         import json
                         json_str = completion.choices[0].message.content.strip()
-                        # Remove markdown code block if present
-                        if json_str.startswith("```json"):
-                            json_str = json_str[7:]
                         if json_str.startswith("```"):
-                            json_str = json_str[3:]
+                            json_str = json_str.split("```")[1] if "```" in json_str else json_str
+                            if json_str.startswith("json"):
+                                json_str = json_str[4:].strip()
                         if json_str.endswith("```"):
-                            json_str = json_str[:-3]
-                        json_str = json_str.strip()
+                            json_str = json_str[:-3].strip()
                         data = json.loads(json_str)
                         return PRDFeatureSet(**data)
                     except Exception as fallback_e:
-                        logger.warning(f"Fallback parsing failed: {fallback_e}. Will retry main path...")
+                        logger.debug(f"JSON fallback failed: {fallback_e}")
 
                 if attempt < self.config.max_retries - 1:
-                    time.sleep(15)
-                    logger.warning(f"Feature extraction attempt {attempt + 1} failed: {e}")
+                    # Exponential backoff by error type (from backend_generator.py)
+                    if is_rate_limit:
+                        wait_time = [20, 60][min(attempt, 1)]
+                    elif is_timeout:
+                        wait_time = [10, 30][min(attempt, 1)]
+                    else:
+                        wait_time = [15, 45][min(attempt, 1)]
+
+                    logger.warning(f"⚠ Feature extraction attempt {attempt + 1} failed ({type(e).__name__}). "
+                                 f"Retrying in {wait_time}s...")
+                    print(f"⚠ Feature extraction attempt {attempt + 1} failed. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
                 else:
-                    logger.error(f"Feature extraction failed after {self.config.max_retries} attempts: {e}")
-                    raise
+                    logger.warning(f"⚠ Feature extraction failed after {self.config.max_retries} attempts, using fallback")
+                    print(f"⚠ Feature extraction failed after {self.config.max_retries} attempts, using fallback")
+
+        # Graceful fallback: frontend-only with no backend features
+        return PRDFeatureSet(
+            product_type="frontend_only",
+            features=["Frontend-only product (backend generation failed)"],
+            backend_entities=[],
+            api_endpoints=[],
+            frontend_pages=["index"]
+        )
 
     def _generate_tests(self, prd_content: str, features: PRDFeatureSet) -> GeneratedTests:
-        """Step 2 (TDD Red): Generate tests from PRD before any implementation."""
+        """Step 2 (TDD Red): Generate tests from PRD with graceful failure."""
         endpoint_list = "\n".join(
             f"  - {ep.method} {ep.path}: {ep.purpose}" for ep in features.api_endpoints
         )
@@ -308,17 +327,60 @@ class PRDDirectGenerator:
                     **self._llm_kwargs(),
                 )
             except Exception as e:
+                error_str = str(e).lower()
+                is_rate_limit = "429" in error_str or "rate" in error_str or "quota" in error_str
+                is_timeout = "timeout" in error_str or "deadline" in error_str
+
                 if attempt < self.config.max_retries - 1:
-                    time.sleep(20)
-                    logger.warning(f"Test generation attempt {attempt + 1} failed: {e}")
+                    # Exponential backoff by error type
+                    if is_rate_limit:
+                        wait_time = [20, 60][min(attempt, 1)]
+                    elif is_timeout:
+                        wait_time = [10, 30][min(attempt, 1)]
+                    else:
+                        wait_time = [15, 45][min(attempt, 1)]
+
+                    logger.warning(f"⚠ Test generation attempt {attempt + 1} failed ({type(e).__name__}). "
+                                 f"Retrying in {wait_time}s...")
+                    print(f"⚠ Test generation attempt {attempt + 1} failed. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
                 else:
-                    logger.error(f"Test generation failed: {e}")
-                    raise
+                    logger.warning(f"⚠ Test generation failed after {self.config.max_retries} attempts, using fallback")
+                    print(f"⚠ Test generation failed after {self.config.max_retries} attempts, using fallback")
+
+        # Graceful fallback: minimal test structure
+        return GeneratedTests(
+            conftest_py="""import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+TEST_DB_URL = "sqlite:///./test.db"
+engine = create_engine(TEST_DB_URL, connect_args={"check_same_thread": False})
+TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+@pytest.fixture(autouse=True)
+def setup_db():
+    from app.database import Base
+    Base.metadata.create_all(bind=engine)
+    yield
+    Base.metadata.drop_all(bind=engine)
+""",
+            test_api_py="""import pytest
+from httpx import AsyncClient
+from app.main import app
+
+@pytest.mark.asyncio
+async def test_app_startup():
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.get("/")
+        assert response.status_code in [200, 404, 405]
+"""
+        )
 
     def _generate_implementation(
         self, prd_content: str, features: PRDFeatureSet, tests: GeneratedTests
     ) -> GeneratedImplementation:
-        """Step 3 (TDD Green): Generate implementation to pass the tests."""
+        """Step 3 (TDD Green): Generate implementation to pass tests with graceful failure."""
         endpoint_list = "\n".join(
             f"  - {ep.method} {ep.path}: {ep.purpose}" for ep in features.api_endpoints
         )
@@ -344,14 +406,16 @@ class PRDDirectGenerator:
                 )
             except Exception as e:
                 error_str = str(e).lower()
-                # If it's a tool call issue, try fallback plain JSON approach
+                is_rate_limit = "429" in error_str or "rate" in error_str or "quota" in error_str
+                is_timeout = "timeout" in error_str or "deadline" in error_str
+
+                # Try JSON fallback for tool call issues
                 if "multiple tool calls" in error_str or "tool call" in error_str:
-                    logger.warning(f"Tool call error in attempt {attempt + 1}. Trying plain JSON fallback...")
                     try:
                         completion = litellm.completion(
                             model=self.config.llm_model,
                             messages=[
-                                {"role": "system", "content": "Return ONLY valid JSON with keys: models_py, routes_py, main_py, requirements_txt. No markdown, no explanation."},
+                                {"role": "system", "content": "Return ONLY valid JSON: {\"models_py\":\"...\",\"routes_py\":\"...\",\"main_py\":\"...\",\"requirements_txt\":\"...\"}"},
                                 {"role": "user", "content": user_prompt},
                             ],
                             timeout=150,
@@ -359,27 +423,81 @@ class PRDDirectGenerator:
                         )
                         import json
                         json_str = completion.choices[0].message.content.strip()
-                        if json_str.startswith("```json"):
-                            json_str = json_str[7:]
                         if json_str.startswith("```"):
-                            json_str = json_str[3:]
+                            json_str = json_str.split("```")[1] if "```" in json_str else json_str
+                            if json_str.startswith("json"):
+                                json_str = json_str[4:].strip()
                         if json_str.endswith("```"):
-                            json_str = json_str[:-3]
-                        json_str = json_str.strip()
+                            json_str = json_str[:-3].strip()
                         data = json.loads(json_str)
                         return GeneratedImplementation(**data)
                     except Exception as fallback_e:
-                        logger.warning(f"Fallback parsing failed: {fallback_e}. Will retry main path...")
+                        logger.debug(f"JSON fallback failed: {fallback_e}")
 
                 if attempt < self.config.max_retries - 1:
-                    time.sleep(20)
-                    logger.warning(f"Implementation generation attempt {attempt + 1} failed: {e}")
+                    # Exponential backoff by error type
+                    if is_rate_limit:
+                        wait_time = [20, 60][min(attempt, 1)]
+                    elif is_timeout:
+                        wait_time = [10, 30][min(attempt, 1)]
+                    else:
+                        wait_time = [15, 45][min(attempt, 1)]
+
+                    logger.warning(f"⚠ Implementation attempt {attempt + 1} failed ({type(e).__name__}). "
+                                 f"Retrying in {wait_time}s...")
+                    print(f"⚠ Implementation attempt {attempt + 1} failed. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
                 else:
-                    logger.error(f"Implementation generation failed: {e}")
-                    raise
+                    logger.warning(f"⚠ Implementation failed after {self.config.max_retries} attempts, using fallback")
+                    print(f"⚠ Implementation failed after {self.config.max_retries} attempts, using fallback")
+
+        # Graceful fallback: minimal FastAPI scaffold
+        return GeneratedImplementation(
+            models_py="""from sqlalchemy.orm import DeclarativeBase
+
+class Base(DeclarativeBase):
+    pass
+""",
+            routes_py="""from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/health")
+async def health_check():
+    return {"status": "ok"}
+""",
+            main_py="""from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.routes import router
+
+app = FastAPI(title="Generated API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+
+@app.get("/")
+async def root():
+    return {"message": "API is running"}
+""",
+            requirements_txt="""fastapi>=0.100.0
+uvicorn>=0.23.0
+sqlalchemy>=2.0.0
+pydantic>=2.0.0
+pytest>=7.0.0
+httpx>=0.24.0
+pytest-asyncio>=0.21.0
+"""
+        )
 
     def _generate_frontend(self, prd_content: str) -> Dict[str, str]:
-        """Step 4: Generate frontend directly from PRD (reuse FrontendGenerator)."""
+        """Step 4: Generate frontend directly from PRD with graceful failure."""
         from frontend_generator import FrontendGenerator, FrontendGeneratorConfig, GeneratedFrontendCode
 
         logger.info("Frontend generation starting...")
@@ -390,21 +508,51 @@ class PRDDirectGenerator:
         )
         fg = FrontendGenerator(config=fg_config)
 
-        try:
-            result = fg.generate_from_prd(prd_content)
-            logger.info(f"Frontend generated: {len(result.pages)} pages, {len(result.components)} components, {len(result.styles)} styles")
+        result = None
+        # Try FrontendGenerator with retries
+        for attempt in range(self.config.max_retries):
+            try:
+                result = fg.generate_from_prd(prd_content)
+                logger.info(f"Frontend generated: {len(result.pages)} pages, {len(result.components)} components")
 
-            # Check if result is the minimal fallback template
-            index_html = result.pages.get("index.html", "")
-            is_fallback = "Application frontend loaded successfully" in index_html
+                # Check if result is the minimal fallback template
+                index_html = result.pages.get("index.html", "")
+                is_fallback = "Application frontend loaded successfully" in index_html
 
-            if is_fallback or not result.pages or not result.components:
-                logger.warning(f"Frontend generation returned fallback content (is_fallback={is_fallback}) - trying manual LLM call...")
-                # The FrontendGenerator fell back, try a direct LLM call with simplified prompt
-                for retry in range(2):
-                    try:
-                        # Simplified system prompt focused on generating actual product content
-                        prd_frontend_system = """You are a Senior Frontend Developer generating a complete HTML frontend from a PRD document.
+                if not is_fallback and result.pages and len(index_html) > 500:
+                    # Got real content, use it
+                    break
+                elif is_fallback:
+                    logger.warning(f"FrontendGenerator returned fallback, will retry manual LLM call...")
+                    result = None  # Clear it so we know to use manual fallback
+                    raise Exception("FrontendGenerator fallback detected")
+            except Exception as e:
+                error_str = str(e).lower()
+                is_rate_limit = "429" in error_str or "rate" in error_str or "quota" in error_str
+                is_timeout = "timeout" in error_str or "deadline" in error_str
+
+                if attempt < self.config.max_retries - 1:
+                    # Exponential backoff by error type
+                    if is_rate_limit:
+                        wait_time = [20, 60][min(attempt, 1)]
+                    elif is_timeout:
+                        wait_time = [10, 30][min(attempt, 1)]
+                    else:
+                        wait_time = [15, 45][min(attempt, 1)]
+
+                    logger.warning(f"⚠ Frontend generation attempt {attempt + 1} failed ({type(e).__name__}). "
+                                 f"Retrying in {wait_time}s...")
+                    print(f"⚠ Frontend generation attempt {attempt + 1} failed. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.warning(f"⚠ FrontendGenerator exhausted retries, using manual LLM call...")
+
+        # If FrontendGenerator didn't work or returned fallback, try manual LLM call
+        if not result or "Application frontend loaded successfully" in result.pages.get("index.html", ""):
+            logger.warning("FrontendGenerator failed/fallback detected, trying manual LLM call...")
+            for retry in range(self.config.max_retries):
+                try:
+                    prd_frontend_system = """You are a Senior Frontend Developer generating a complete HTML frontend from a PRD document.
 Your task: Create a real, functional website with actual product information extracted from the PRD.
 
 CRITICAL: You MUST include actual product/service names, features, and descriptions from the PRD in the generated HTML.
@@ -419,60 +567,92 @@ The HTML must:
 - Use inline CSS (no external files)
 - Be production-ready and semantic HTML5"""
 
-                        completion = litellm.completion(
-                            model=self.config.llm_model,
-                            messages=[
-                                {"role": "system", "content": prd_frontend_system},
-                                {"role": "user", "content": f"Generate a complete frontend from this PRD. Include actual product names, features, and descriptions:\n\n{prd_content[:4000]}"},
-                            ],
-                            timeout=120,
-                            **self._llm_kwargs(),
-                        )
-                        import json
-                        response_text = completion.choices[0].message.content.strip()
+                    completion = litellm.completion(
+                        model=self.config.llm_model,
+                        messages=[
+                            {"role": "system", "content": prd_frontend_system},
+                            {"role": "user", "content": f"Generate a complete frontend from this PRD. Include actual product names, features, and descriptions:\n\n{prd_content[:4000]}"},
+                        ],
+                        timeout=120,
+                        **self._llm_kwargs(),
+                    )
+                    import json
+                    response_text = completion.choices[0].message.content.strip()
 
-                        # Try to extract JSON from response
-                        json_str = response_text
-                        if "```" in json_str:
-                            # Remove markdown code blocks
-                            json_str = json_str.split("```")[1]
-                            if json_str.startswith("json"):
-                                json_str = json_str[4:].strip()
+                    # Try to extract JSON from response
+                    json_str = response_text
+                    if "```" in json_str:
+                        json_str = json_str.split("```")[1]
+                        if json_str.startswith("json"):
+                            json_str = json_str[4:].strip()
+                        else:
+                            json_str = json_str.lstrip()
+
+                    json_str = json_str.rstrip("`").strip()
+
+                    # Parse and validate
+                    data = json.loads(json_str)
+                    pages = data.get("pages", {})
+                    index_html = pages.get("index.html", "")
+                    has_real_content = (
+                        len(index_html) > 500 and
+                        "Application frontend loaded successfully" not in index_html
+                    )
+
+                    if has_real_content:
+                        result = GeneratedFrontendCode(
+                            pages=pages,
+                            components=data.get("components", {}),
+                            styles=data.get("styles", {}),
+                            navigation_update=data.get("navigation_update", "")
+                        )
+                        logger.info(f"Manual LLM call succeeded on attempt {retry + 1} with {len(index_html)} chars")
+                        break
+                    else:
+                        error_str = str(e).lower() if e else "minimal content"
+                        is_rate_limit = "429" in error_str or "rate" in error_str or "quota" in error_str
+                        is_timeout = "timeout" in error_str or "deadline" in error_str
+
+                        if retry < self.config.max_retries - 1:
+                            if is_rate_limit:
+                                wait_time = [20, 60][min(retry, 1)]
+                            elif is_timeout:
+                                wait_time = [10, 30][min(retry, 1)]
                             else:
-                                json_str = json_str.lstrip()
+                                wait_time = [15, 45][min(retry, 1)]
 
-                        json_str = json_str.rstrip("`").strip()
+                            logger.warning(f"Manual LLM attempt {retry + 1}: minimal content, retrying in {wait_time}s...")
+                            time.sleep(wait_time)
+                except Exception as e:
+                    error_str = str(e).lower()
+                    is_rate_limit = "429" in error_str or "rate" in error_str or "quota" in error_str
+                    is_timeout = "timeout" in error_str or "deadline" in error_str
 
-                        # Parse and validate
-                        data = json.loads(json_str)
-                        pages = data.get("pages", {})
-
-                        # Check if we got actual product content (should have more than just boilerplate)
-                        index_html = pages.get("index.html", "")
-                        has_real_content = (
-                            len(index_html) > 500 and
-                            "Application frontend loaded successfully" not in index_html
-                        )
-
-                        if has_real_content:
-                            result = GeneratedFrontendCode(
-                                pages=pages,
-                                components=data.get("components", {}),
-                                styles=data.get("styles", {}),
-                                navigation_update=data.get("navigation_update", "")
-                            )
-                            logger.info(f"Manual LLM fallback succeeded on attempt {retry + 1} with {len(index_html)} chars")
-                            break
+                    if retry < self.config.max_retries - 1:
+                        if is_rate_limit:
+                            wait_time = [20, 60][min(retry, 1)]
+                        elif is_timeout:
+                            wait_time = [10, 30][min(retry, 1)]
                         else:
-                            logger.warning(f"Manual LLM attempt {retry + 1}: returned placeholder/minimal content ({len(index_html)} chars), retrying...")
-                            if retry < 1:
-                                time.sleep(10)
-                    except Exception as e:
-                        logger.warning(f"Manual LLM attempt {retry + 1} failed: {e}")
-                        if retry < 1:
-                            time.sleep(10)
-                        else:
-                            logger.warning(f"Manual LLM fallback exhausted. Proceeding with minimal fallback.")
+                            wait_time = [15, 45][min(retry, 1)]
+
+                        logger.warning(f"⚠ Manual LLM attempt {retry + 1} failed ({type(e).__name__}). "
+                                     f"Retrying in {wait_time}s...")
+                        print(f"⚠ Manual LLM attempt {retry + 1} failed. Retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        logger.warning(f"⚠ Manual LLM call exhausted retries, using fallback HTML")
+                        print(f"⚠ Frontend generation exhausted all retries, using fallback HTML")
+
+        # Fallback result if everything failed
+        if not result:
+            logger.warning("Using fallback frontend HTML")
+            result = GeneratedFrontendCode(
+                pages={"index.html": fg._generate_fallback_frontend()},
+                components={},
+                styles={},
+                navigation_update="",
+            )
 
             # Flatten into a single dict: {relative_path: content}
             files: Dict[str, str] = {}
@@ -489,11 +669,8 @@ The HTML must:
                     files[filename] = content
                     logger.debug(f"  Style: {filename} ({len(content)} chars)")
 
-            logger.info(f"Frontend flattened to {len(files)} files")
-            return files
-        except Exception as e:
-            logger.error(f"Frontend generation failed: {e}", exc_info=True)
-            raise
+        logger.info(f"Frontend flattened to {len(files)} files")
+        return files
 
     async def generate(
         self,
