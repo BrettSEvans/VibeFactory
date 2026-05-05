@@ -654,20 +654,20 @@ The HTML must:
                 navigation_update="",
             )
 
-            # Flatten into a single dict: {relative_path: content}
-            files: Dict[str, str] = {}
-            for filename, content in result.pages.items():
-                if content and content.strip():  # Only add non-empty files
-                    files[filename] = content
-                    logger.debug(f"  Page: {filename} ({len(content)} chars)")
-            for filename, content in result.components.items():
-                if content and content.strip():
-                    files[f"js/{filename}"] = content
-                    logger.debug(f"  Component: {filename} ({len(content)} chars)")
-            for filename, content in result.styles.items():
-                if content and content.strip():
-                    files[filename] = content
-                    logger.debug(f"  Style: {filename} ({len(content)} chars)")
+        # Flatten into a single dict: {relative_path: content}
+        files: Dict[str, str] = {}
+        for filename, content in result.pages.items():
+            if content and content.strip():  # Only add non-empty files
+                files[filename] = content
+                logger.debug(f"  Page: {filename} ({len(content)} chars)")
+        for filename, content in result.components.items():
+            if content and content.strip():
+                files[f"js/{filename}"] = content
+                logger.debug(f"  Component: {filename} ({len(content)} chars)")
+        for filename, content in result.styles.items():
+            if content and content.strip():
+                files[filename] = content
+                logger.debug(f"  Style: {filename} ({len(content)} chars)")
 
         logger.info(f"Frontend flattened to {len(files)} files")
         return files
